@@ -1,0 +1,25 @@
+[Unit]
+Description=CyberSchedule Ratings Sync API
+After=network.target
+
+[Service]
+Type=simple
+User=ratings
+Group=ratings
+WorkingDirectory=/var/www/ratings-api
+EnvironmentFile=/etc/ratings-api.env
+ExecStart=/usr/bin/node server.js
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ratings-api
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/www/ratings-api/data
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
