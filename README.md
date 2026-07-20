@@ -17,6 +17,9 @@ CyberSchedule TimeSlotRating 同步服务，部署在 `api.epoch0.org`。
   - 请求体：`{ records: TimeSlotRating[], since?: string }`
   - 响应：`{ applied, rejected, errors?, records, server_time }`
   - 冲突策略：**last-write-wins**（比较 `updated_at` ISO 字符串字典序，ISO 8601 可直接比较）
+- `GET /internal/summary?days=7|28` — 同机鹊桥专用只读汇总；使用独立 `INTERNAL_TOKEN`，nginx 公网入口对 `/internal/` 返回 404
+  - 返回总体均值、按日、星期×时段、活动聚合，以及最多 5 条匿名化反思摘录
+  - 自动排除软删除记录，窗口只允许 7/28 天，防止 AI 结论越过证据范围
 
 ## 数据 schema
 
@@ -76,4 +79,3 @@ TOKEN=<server token> HOST=https://api.epoch0.org bash deploy/smoke.sh
 
 - SQLite 定期备份（systemd timer + rsync `/var/www/ratings-api/data/ratings.db` 到另一路径或 R2/S3）
 - 打分频率/每日平均分的轻量 metrics 端点（给 Lux 读）
-

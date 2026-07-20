@@ -2,8 +2,10 @@ import Fastify from 'fastify';
 import Database from 'better-sqlite3';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { buildSummary, parseSummaryDays } from './summary.js';
 
 const SYNC_TOKEN = process.env.SYNC_TOKEN;
+const INTERNAL_TOKEN = process.env.INTERNAL_TOKEN;
 const PORT = Number(process.env.PORT ?? 3000);
 const DB_PATH = process.env.DB_PATH ?? './data/ratings.db';
 
@@ -145,14 +147,31 @@ const fastify = Fastify({
 
 fastify.addHook('onRequest', async (req, reply) => {
   if (req.url === '/v1/healthz') return;
+  if (req.url.startsWith('/internal/')) {
+    if (!INTERNAL_TOKEN || INTERNAL_TOKEN.length < 32) {
+      return reply.code(503).send({ error: 'internal_api_not_configured' });
+    }
+    const auth = req.headers.authorization ?? '';
+    if (!auth.startsWith('Bearer ') || auth.slice(7) !== INTERNAL_TOKEN) {
+      return reply.code(401).send({ error: 'unauthorized' });
+    }
+    return;
+  }
   const auth = req.headers.authorization ?? '';
   if (!auth.startsWith('Bearer ') || auth.slice(7) !== SYNC_TOKEN) {
-    reply.code(401).send({ error: 'unauthorized' });
+    return reply.code(401).send({ error: 'unauthorized' });
   }
 });
 
 fastify.get('/v1/healthz', async () => {
   return { ok: true, ts: new Date().toISOString() };
+});
+
+// 仅供同机鹊桥直连。nginx 对公网屏蔽 /internal/，此处再用独立 token 做第二道门。
+fastify.get('/internal/summary', async (req, reply) => {
+  const days = parseSummaryDays(req.query?.days);
+  if (!days) return reply.code(400).send({ error: 'days must be 7 or 28' });
+  return buildSummary(db, days);
 });
 
 fastify.get('/v1/ratings', async (req, reply) => {
