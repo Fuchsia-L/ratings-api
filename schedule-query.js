@@ -6,7 +6,9 @@
 import {
   expandRepeatingEvents,
   formatShanghaiDate,
+  formatShanghaiDateTime,
   getSemesterWeek,
+  parseShanghai,
   shanghaiDayEnd,
   shanghaiDayStart,
   shanghaiToday,
@@ -63,15 +65,17 @@ function loadRatings(db, eventIds) {
 }
 
 function matchRatings(candidates, instance) {
-  const instStart = Date.parse(instance.instance_start);
-  const instEnd = Date.parse(instance.instance_end);
-  const instDay = formatShanghaiDate(instance.instance_start);
+  // 实例时间是裸上海格式（业务语义），ratings.slot_* 是真 UTC ISO（同步语义）——
+  // 比较前必须各按各的语义换成绝对时刻，不能对裸格式用 Date.parse（那会看进程时区）。
+  const instStart = parseShanghai(instance.instance_start);
+  const instEnd = parseShanghai(instance.instance_end);
+  const instDay = formatShanghaiDate(instStart);
   return candidates
     .filter((r) => {
       const s = Date.parse(r.slot_start);
       const e = Date.parse(r.slot_end);
       if (Number.isFinite(s) && Number.isFinite(e) && s < instEnd && e > instStart) return true;
-      return Number.isFinite(s) && formatShanghaiDate(r.slot_start) === instDay;
+      return Number.isFinite(s) && formatShanghaiDate(s) === instDay;
     })
     .map((r) => ({
       rating: r.rating,
@@ -123,8 +127,9 @@ export function buildWindow(store, startIso, endIso, now = new Date()) {
   const semester = readSemester(store);
 
   return {
-    start: start.toISOString(),
-    end: end.toISOString(),
+    // 回显窗口用裸上海格式，与 events 的 instance_* 同语义（消费端是人和 Claude）。
+    start: formatShanghaiDateTime(start),
+    end: formatShanghaiDateTime(end),
     semester_week: semester ? getSemesterWeek(semester.start_date, start) : null,
     events: collectEvents(store, start, end),
     last_synced: lastSynced(store),
@@ -133,8 +138,11 @@ export function buildWindow(store, startIso, endIso, now = new Date()) {
 }
 
 /**
- * 窗口参数校验。start/end 接受完整 ISO 时刻或 YYYY-MM-DD（后者按 Asia/Shanghai 当日
- * 00:00 / 23:59:59.999 解读）。时间点查询 = start === end，允许。
+ * 窗口参数校验。start/end 接受：
+ * - `YYYY-MM-DD` —— 按 Asia/Shanghai 当日 00:00 / 23:59:59.999
+ * - 裸格式 `YYYY-MM-DDTHH:mm:ss` —— 按上海钟点（与业务字段同语义）
+ * - 带 Z / 带 offset 的 ISO —— 按其声明时区
+ * 时间点查询 = start === end，允许。
  */
 export function validateWindow(startRaw, endRaw) {
   if (typeof startRaw !== 'string' || !startRaw) return { error: 'start required' };
@@ -147,11 +155,15 @@ export function validateWindow(startRaw, endRaw) {
     return { error: 'end must be ISO datetime or YYYY-MM-DD' };
   }
 
-  const start = DATE_RE.test(startRaw) ? shanghaiDayStart(startRaw) : new Date(startRaw);
-  const end = DATE_RE.test(endRaw) ? shanghaiDayEnd(endRaw) : new Date(endRaw);
+  const start = DATE_RE.test(startRaw) ? shanghaiDayStart(startRaw) : new Date(parseShanghai(startRaw));
+  const end = DATE_RE.test(endRaw) ? shanghaiDayEnd(endRaw) : new Date(parseShanghai(endRaw));
 
-  if (Number.isNaN(start.getTime())) return { error: 'start must be ISO datetime or YYYY-MM-DD' };
-  if (Number.isNaN(end.getTime())) return { error: 'end must be ISO datetime or YYYY-MM-DD' };
+  if (Number.isNaN(start.getTime())) {
+    return { error: 'start must be YYYY-MM-DD, YYYY-MM-DDTHH:mm:ss (Asia/Shanghai), or a zoned ISO datetime' };
+  }
+  if (Number.isNaN(end.getTime())) {
+    return { error: 'end must be YYYY-MM-DD, YYYY-MM-DDTHH:mm:ss (Asia/Shanghai), or a zoned ISO datetime' };
+  }
   if (end.getTime() < start.getTime()) return { error: 'end must not be before start' };
   if (end.getTime() - start.getTime() > MAX_WINDOW_DAYS * DAY_MS) {
     return { error: `window must not exceed ${MAX_WINDOW_DAYS} days` };

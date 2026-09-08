@@ -11,9 +11,91 @@
 export const SHANGHAI_OFFSET_MS = 8 * 60 * 60 * 1000;
 const DAY_MS = 86400000;
 
-/** ISO 字符串或 Date → epoch ms。 */
+/**
+ * 业务时间字段（start_time / end_time / repeat_until / last_reset）的规范存储格式：
+ * 裸本地 `YYYY-MM-DDTHH:mm:ss`，语义是 **floating Asia/Shanghai 钟点**（合约第 20 条）。
+ *
+ * app（whut-import 导入的真课表）就是这么存这么推的：`2026-09-08T08:00:00`，
+ * 无 Z 无 offset 无毫秒。`new Date('2026-09-08T08:00:00')` 会按**进程时区**解析——
+ * 服务端 TZ=UTC 时被当成 08:00Z，整条链平移 +8，上海 14:00 的课会显示成 22:00。
+ * 所以裸格式一律由 parseShanghai 按上海钟点解释，绝不走 `new Date(裸串)`。
+ *
+ * 同步字段（created_at / updated_at / synced_at / deleted_at）不在此列：
+ * 那些是真 UTC 毫秒 ISO，照常用 Date 解析比较。
+ */
+const NAIVE_DATETIME_RE = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?(?:\.(\d{1,3}))?$/;
+const DATE_ONLY_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
+/** 带 Z 或 ±HH:mm 偏移的输入——由 Date 正确解析成绝对时刻。 */
+const HAS_ZONE_RE = /(?:Z|[+-]\d{2}:?\d{2})$/i;
+
+/** Date.UTC 会把 2 月 30 日、25:00 等自动滚动；业务时间必须逐分量严格匹配。 */
+function strictUtcParts(y, mo, d, h = 0, mi = 0, s = 0, ms = 0) {
+  const wallMs = Date.UTC(y, mo - 1, d, h, mi, s, ms);
+  const wall = new Date(wallMs);
+  if (
+    wall.getUTCFullYear() !== y
+    || wall.getUTCMonth() + 1 !== mo
+    || wall.getUTCDate() !== d
+    || wall.getUTCHours() !== h
+    || wall.getUTCMinutes() !== mi
+    || wall.getUTCSeconds() !== s
+    || wall.getUTCMilliseconds() !== ms
+  ) return NaN;
+  return wallMs;
+}
+
+/**
+ * 业务时间字符串 → epoch ms，一律按 Asia/Shanghai 语义。
+ *
+ * - 裸格式 `2026-09-08T08:00:00`（可带毫秒、可用空格分隔）→ 上海钟点
+ * - 纯日期 `2026-09-08` → 上海当日 00:00
+ * - 带 Z / 带 offset → 按其声明时区换算成绝对时刻（再由 formatShanghai* 转成上海钟点）
+ * - Date 实例 → 直接取 getTime()
+ *
+ * 解析失败返回 NaN，由调用方决定拒绝还是跳过。
+ */
+export function parseShanghai(value) {
+  if (value instanceof Date) return value.getTime();
+  if (typeof value !== 'string') return NaN;
+  const text = value.trim();
+  if (!text) return NaN;
+
+  const naive = NAIVE_DATETIME_RE.exec(text);
+  if (naive) {
+    const [, y, mo, d, h, mi, s, ms] = naive;
+    const wallMs = strictUtcParts(
+      Number(y), Number(mo), Number(d),
+      Number(h), Number(mi), Number(s ?? 0), Number((ms ?? '0').padEnd(3, '0')),
+    );
+    return Number.isFinite(wallMs) ? wallMs - SHANGHAI_OFFSET_MS : NaN;
+  }
+  if (DATE_ONLY_RE.test(text)) {
+    const [, y, mo, d] = DATE_ONLY_RE.exec(text);
+    const wallMs = strictUtcParts(Number(y), Number(mo), Number(d));
+    return Number.isFinite(wallMs) ? wallMs - SHANGHAI_OFFSET_MS : NaN;
+  }
+  if (HAS_ZONE_RE.test(text)) return Date.parse(text);
+  // 认不出的形状：不猜，交给调用方按无效处理。
+  return NaN;
+}
+
+/**
+ * epoch ms / 任意可解析输入 → 规范存储格式：裸上海 `YYYY-MM-DDTHH:mm:ss`。
+ * 带 Z / 带 offset / 带毫秒的输入在这里被换算并抹平成上海钟点。
+ */
+export function formatShanghaiDateTime(value) {
+  const ms = typeof value === 'number' ? value : parseShanghai(value);
+  if (!Number.isFinite(ms)) return null;
+  const t = new Date(ms + SHANGHAI_OFFSET_MS);
+  const p = (n, w = 2) => String(n).padStart(w, '0');
+  return `${t.getUTCFullYear()}-${p(t.getUTCMonth() + 1)}-${p(t.getUTCDate())}`
+    + `T${p(t.getUTCHours())}:${p(t.getUTCMinutes())}:${p(t.getUTCSeconds())}`;
+}
+
+/** 业务时间字符串 / Date / epoch ms → epoch ms（内部统一入口）。 */
 function toMs(value) {
-  return value instanceof Date ? value.getTime() : new Date(value).getTime();
+  if (typeof value === 'number') return value;
+  return value instanceof Date ? value.getTime() : parseShanghai(value);
 }
 
 /**
@@ -116,11 +198,15 @@ export function expandRepeatingEvents(events, rangeStart, rangeEnd) {
   return result;
 }
 
+/**
+ * 实例时间输出为裸上海格式（合约第 20 条）——消费端是人和 Claude，本地钟点最直读。
+ * 母事件的 start_time / end_time 原样保留（已是裸上海格式）。
+ */
 function withInstance(event, startMs, endMs) {
   return {
     ...event,
-    instance_start: new Date(startMs).toISOString(),
-    instance_end: new Date(endMs).toISOString(),
+    instance_start: formatShanghaiDateTime(startMs),
+    instance_end: formatShanghaiDateTime(endMs),
   };
 }
 
@@ -185,10 +271,10 @@ export function shanghaiWeekStartMs(value) {
  */
 export function getSemesterWeek(semesterStart, date) {
   if (!semesterStart) return null;
-  const startInput = /^\d{4}-\d{2}-\d{2}$/.test(semesterStart)
-    ? shanghaiDayStart(semesterStart)
-    : new Date(semesterStart);
-  const startMs = shanghaiWeekStartMs(startInput);
+  // parseShanghai 已经统一处理纯日期 / 裸格式 / 带时区三种形状。
+  const startMs0 = parseShanghai(semesterStart);
+  if (!Number.isFinite(startMs0)) return null;
+  const startMs = shanghaiWeekStartMs(startMs0);
   const currentMs = shanghaiWeekStartMs(date);
   if (!Number.isFinite(startMs) || !Number.isFinite(currentMs)) return null;
   const weeks = Math.floor((currentMs - startMs) / (7 * DAY_MS)) + 1;

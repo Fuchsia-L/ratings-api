@@ -124,6 +124,29 @@ sqlite3 /var/www/ratings-api/data/ratings.db \
 401/403 被鉴权钩子挡在路由之前，**不落 audit 行**——审计记的是「被授权的调用做了什么」。
 app 的批量同步端点同样不落行（那是手机的日常动作，不是谁的定向写入）。
 
+## 业务时间字段的格式（合约第 20 条）
+
+时间字段分两套语义，**别混**：
+
+| 类别 | 字段 | 语义 | 格式 |
+|---|---|---|---|
+| 业务时间 | `start_time`、`end_time`、`repeat_until`、`last_reset` | floating **Asia/Shanghai**（墙上钟点） | 裸本地 `YYYY-MM-DDTHH:mm:ss`（日期字段 `YYYY-MM-DD`） |
+| 同步时间 | `created_at`、`updated_at`、`synced_at`、`deleted_at`、`last_synced` | 绝对时刻 | 真 UTC 毫秒 ISO `...Z` |
+
+业务时间的规范存储格式与 app 现状一致（whut-import 导入的真课表就是 `2026-09-08T08:00:00`，
+无 Z 无毫秒），app 零改动。
+
+**输入容忍**：带 `Z`、带 `±HH:mm` 偏移、带毫秒的输入一律先按其声明时区换算成上海钟点，
+再规范化成裸格式入库。所以 `2026-09-08T06:00:00Z` 与 `2026-09-08T14:00:00` 存进去是同一行。
+
+**输出**：查询响应的 `instance_start` / `instance_end` 也是裸上海格式——消费端是人和 Claude，
+本地钟点最直读。
+
+**为什么必须这么定**：`new Date('2026-09-08T08:00:00')` 会按**进程时区**解析裸串。
+服务端 `TZ=UTC` 时它变成 `08:00Z`，整条链平移 +8——Iris 14:00 的 C++ 课在 `klass day` 里
+显示成 22:00（9/8 生产实测 bug）。所以裸格式一律走 `parseShanghai()`，
+**禁止对业务时间用 `new Date(裸串)` 或 `Date.parse(裸串)`**。
+
 ## 时区（本项目最大的坑）
 
 app 的 `repeat.ts` 跑在手机本地时区，node 服务端进程默认 UTC。移植版

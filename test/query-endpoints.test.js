@@ -66,10 +66,11 @@ test('day: 重复课在后续周正确展开，母值不变', async (t) => {
     assert.equal(body.events.length, 1, `${date} 应有一节课`);
     const e = body.events[0];
     assert.equal(e.id, 'evt-1', '实例继承母事件 id');
-    assert.equal(e.start_time, '2026-09-07T08:00:00.000+08:00', '母值保持不变');
-    assert.equal(e.end_time, '2026-09-07T09:40:00.000+08:00');
-    assert.equal(e.instance_start, new Date(`${instDate}T08:00:00.000+08:00`).toISOString());
-    assert.equal(e.instance_end, new Date(`${instDate}T09:40:00.000+08:00`).toISOString());
+    assert.equal(e.start_time, '2026-09-07T08:00:00', '母值保持不变（裸上海格式）');
+    assert.equal(e.end_time, '2026-09-07T09:40:00');
+    // 实例时间同为裸上海格式，直读就是本地钟点
+    assert.equal(e.instance_start, `${instDate}T08:00:00`);
+    assert.equal(e.instance_end, `${instDate}T09:40:00`);
   }
   // 周二没课
   assert.equal((await day(app, '2026-09-08')).json().events.length, 0);
@@ -182,8 +183,8 @@ test('day: 跨午夜课程归到 Asia/Shanghai 起始日', async (t) => {
   await seed(app, {
     events: [scheduleEvent({
       id: 'night', title: '夜间自习', repeat: 'none', repeat_until: null,
-      start_time: '2026-09-07T23:00:00.000+08:00',
-      end_time: '2026-09-08T01:00:00.000+08:00',
+      start_time: '2026-09-07T23:00:00',
+      end_time: '2026-09-08T01:00:00',
     })],
   });
   assert.equal((await day(app, '2026-09-07')).json().events.length, 1, '起始日有');
@@ -196,11 +197,123 @@ test('day: events 按实例开始时间排序', async (t) => {
   t.after(() => { app.close(); db.close(); });
   await seed(app, {
     events: [
-      scheduleEvent({ id: 'pm', repeat: 'none', repeat_until: null, start_time: '2026-09-07T14:00:00.000+08:00', end_time: '2026-09-07T15:00:00.000+08:00' }),
-      scheduleEvent({ id: 'am', repeat: 'none', repeat_until: null, start_time: '2026-09-07T08:00:00.000+08:00', end_time: '2026-09-07T09:00:00.000+08:00' }),
+      scheduleEvent({ id: 'pm', repeat: 'none', repeat_until: null, start_time: '2026-09-07T14:00:00', end_time: '2026-09-07T15:00:00' }),
+      scheduleEvent({ id: 'am', repeat: 'none', repeat_until: null, start_time: '2026-09-07T08:00:00', end_time: '2026-09-07T09:00:00' }),
     ],
   });
   assert.deepEqual((await day(app, '2026-09-07')).json().events.map((e) => e.id), ['am', 'pm']);
+});
+
+/* ---------- 合约第 20 条：业务时间 floating Asia/Shanghai（生产 bug 回归） ---------- */
+
+test('时区: 裸格式推「上海 14:00」的课，day 里就是 14:00', async (t) => {
+  const { app, db } = makeApp();
+  t.after(() => { app.close(); db.close(); });
+  // Iris 真机数据形态：app 推裸本地钟点，无 Z 无毫秒
+  await seed(app, {
+    events: [scheduleEvent({
+      id: 'cpp', title: 'C++', repeat: 'none', repeat_until: null,
+      start_time: '2026-09-08T14:00:00', end_time: '2026-09-08T15:40:00',
+    })],
+  });
+  const e = (await day(app, '2026-09-08')).json().events[0];
+  assert.equal(e.instance_start, '2026-09-08T14:00:00', '不能被平移成 22:00');
+  assert.equal(e.instance_end, '2026-09-08T15:40:00');
+  assert.equal(e.start_time, '2026-09-08T14:00:00', '母值也是裸上海格式');
+});
+
+test('时区: 带 Z 的 06:00Z 推入，day 里显示上海 14:00', async (t) => {
+  const { app, db } = makeApp();
+  t.after(() => { app.close(); db.close(); });
+  await seed(app, {
+    events: [scheduleEvent({
+      id: 'zulu', repeat: 'none', repeat_until: null,
+      start_time: '2026-09-08T06:00:00Z', end_time: '2026-09-08T07:40:00Z',
+    })],
+  });
+  const e = (await day(app, '2026-09-08')).json().events[0];
+  assert.equal(e.instance_start, '2026-09-08T14:00:00');
+  assert.equal(e.start_time, '2026-09-08T14:00:00', '入库时已规范化成裸上海格式');
+});
+
+test('时区: 带 offset 与带毫秒的输入同样规范化', async (t) => {
+  const { app, db } = makeApp();
+  t.after(() => { app.close(); db.close(); });
+  await seed(app, {
+    events: [
+      scheduleEvent({ id: 'off', repeat: 'none', repeat_until: null,
+        start_time: '2026-09-08T14:00:00+08:00', end_time: '2026-09-08T15:00:00+08:00' }),
+      scheduleEvent({ id: 'ms', repeat: 'none', repeat_until: null,
+        start_time: '2026-09-08T16:00:00.250', end_time: '2026-09-08T17:00:00.750' }),
+      scheduleEvent({ id: 'jst', repeat: 'none', repeat_until: null,
+        start_time: '2026-09-08T19:00:00+09:00', end_time: '2026-09-08T20:00:00+09:00' }),
+    ],
+  });
+  const events = (await day(app, '2026-09-08')).json().events;
+  assert.deepEqual(
+    events.map((e) => [e.id, e.instance_start]),
+    [['off', '2026-09-08T14:00:00'], ['ms', '2026-09-08T16:00:00'], ['jst', '2026-09-08T18:00:00']],
+  );
+  // 库里存的也是规范化后的裸格式
+  assert.equal(db.prepare("SELECT start_time FROM schedule_events WHERE id='jst'").get().start_time,
+    '2026-09-08T18:00:00');
+});
+
+test('时区: repeat_until / last_reset 带时区输入被规范化成上海自然日', async (t) => {
+  const { app, db } = makeApp();
+  t.after(() => { app.close(); db.close(); });
+  await seed(app, {
+    events: [scheduleEvent({ id: 'ru', repeat_until: '2026-09-14T16:00:00Z' })],
+    todos: [todoItem({ id: 'lr', last_reset: '2026-09-07T16:00:00Z' })],
+  });
+  // 16:00Z = 上海次日 00:00 → 归到 09-15 / 09-08
+  assert.equal(db.prepare("SELECT repeat_until FROM schedule_events WHERE id='ru'").get().repeat_until, '2026-09-15');
+  assert.equal(db.prepare("SELECT last_reset FROM todos WHERE id='lr'").get().last_reset, '2026-09-08');
+});
+
+test('时区: 同步字段仍是真 UTC ISO，没被业务规范化碰到', async (t) => {
+  const { app, db } = makeApp();
+  t.after(() => { app.close(); db.close(); });
+  await seed(app, { events: [scheduleEvent()] });
+  const row = db.prepare("SELECT * FROM schedule_events WHERE id='evt-1'").get();
+  assert.equal(row.created_at, '2026-09-01T00:00:00.000Z', 'created_at 原样');
+  assert.equal(row.updated_at, '2026-09-01T00:00:00.000Z', 'updated_at 原样');
+  assert.equal(row.start_time, '2026-09-07T08:00:00', '业务时间才是裸格式');
+});
+
+test('时区: window 用裸格式参数查询，回显也是裸上海格式', async (t) => {
+  const { app, db } = makeApp();
+  t.after(() => { app.close(); db.close(); });
+  await seed(app, {
+    events: [scheduleEvent({ id: 'cpp', repeat: 'none', repeat_until: null,
+      start_time: '2026-09-08T14:00:00', end_time: '2026-09-08T15:40:00' })],
+  });
+  const body = (await win(app, '2026-09-08T14:30:00', '2026-09-08T14:30:00')).json();
+  assert.equal(body.events.length, 1, '裸格式时间点应命中正在上的课');
+  assert.equal(body.start, '2026-09-08T14:30:00');
+  assert.equal(body.events[0].instance_start, '2026-09-08T14:00:00');
+  // 带 Z 的等价时刻应得到同样结果
+  const zulu = (await win(app, '2026-09-08T06:30:00Z', '2026-09-08T06:30:00Z')).json();
+  assert.equal(zulu.events.length, 1, '06:30Z = 上海 14:30，同样命中');
+  assert.equal(zulu.start, '2026-09-08T14:30:00');
+});
+
+test('时区: 裸格式课程与 UTC 评分正确关联', async (t) => {
+  const { app, db } = makeApp();
+  t.after(() => { app.close(); db.close(); });
+  await seed(app, {
+    events: [scheduleEvent({ id: 'cpp', repeat: 'none', repeat_until: null,
+      start_time: '2026-09-08T14:00:00', end_time: '2026-09-08T15:40:00' })],
+  });
+  // ratings.slot_* 是真 UTC：上海 14:00 = 06:00Z
+  insertRating(db, {
+    id: 'r1', linked_event_id: 'cpp',
+    slot_start: '2026-09-08T06:00:00.000Z', slot_end: '2026-09-08T07:40:00.000Z',
+    rating: 5, efficiency: 4,
+  });
+  const e = (await day(app, '2026-09-08')).json().events[0];
+  assert.equal(e.ratings.length, 1, '跨语义比较应对上');
+  assert.equal(e.ratings[0].rating, 5);
 });
 
 /* ---------- last_synced（数据新鲜度）语义 ---------- */
@@ -321,7 +434,7 @@ test('window: 展开区间内全部实例', async (t) => {
   const body = (await win(app, '2026-09-07', '2026-09-28')).json();
   assert.deepEqual(
     body.events.map((e) => e.instance_start.slice(0, 10)),
-    ['2026-09-07', '2026-09-14', '2026-09-21', '2026-09-28'].map((d) => new Date(`${d}T08:00:00.000+08:00`).toISOString().slice(0, 10)),
+    ['2026-09-07', '2026-09-14', '2026-09-21', '2026-09-28'],
   );
   assert.equal(body.events.length, 4);
 });
@@ -379,8 +492,8 @@ test('window: YYYY-MM-DD 参数按 Asia/Shanghai 自然日边界解读', async (
   await seed(app, {
     events: [scheduleEvent({
       id: 'late', repeat: 'none', repeat_until: null,
-      start_time: '2026-09-07T23:30:00.000+08:00',
-      end_time: '2026-09-07T23:59:00.000+08:00',
+      start_time: '2026-09-07T23:30:00',
+      end_time: '2026-09-07T23:59:00',
     })],
   });
   assert.equal((await win(app, '2026-09-07', '2026-09-07')).json().events.length, 1);

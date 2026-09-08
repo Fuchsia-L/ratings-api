@@ -4,6 +4,8 @@ import {
   expandRepeatingEvents,
   detectConflicts,
   formatShanghaiDate,
+  formatShanghaiDateTime,
+  parseShanghai,
   getSemesterWeek,
   shanghaiDayStart,
   shanghaiDayEnd,
@@ -85,7 +87,10 @@ test('includes exactly one instance when repeat_until matches the start date', (
   })];
   const expanded = expandRepeatingEvents(events, new Date(start), new Date('2026-03-25T23:59:59.999+08:00'));
   assert.equal(expanded.length, 1);
-  assert.equal(expanded[0].instance_start, events[0].start_time);
+  // instance_* 现在是裸上海格式（合约第 20 条），母事件 start_time 仍是当初推进来的形态。
+  assert.equal(expanded[0].instance_start, '2026-03-21T00:00:00');
+  assert.equal(parseShanghai(expanded[0].instance_start), new Date(events[0].start_time).getTime(),
+    '换算回绝对时刻应与母值一致');
 });
 
 test('returns no instances when repeat_until is before the visible range', () => {
@@ -123,7 +128,8 @@ test('includes an instance that starts on repeat_until even if it ends after mid
     new Date('2026-03-22T23:59:59.999+08:00'),
   );
   assert.equal(expanded.length, 1);
-  assert.equal(new Date(expanded[0].instance_end).getTime(), new Date(end).getTime());
+  assert.equal(parseShanghai(expanded[0].instance_end), new Date(end).getTime());
+  assert.equal(expanded[0].instance_end, '2026-03-22T01:00:00', '裸上海格式');
 });
 
 /* ---------- 时区专项（设计 §6 验收要求） ---------- */
@@ -171,8 +177,10 @@ test('timezone: repeat_until 边界日在 UTC 与 +08 分属不同日期时以 +
     expanded.map((e) => formatShanghaiDate(e.instance_start)),
     ['2026-03-20', '2026-03-21'],
   );
-  // UTC 日会是 03-19/03-20，确认我们没走 UTC
-  assert.equal(expanded[0].instance_start.slice(0, 10), '2026-03-19');
+  // instance_* 是裸上海格式，日期部分直接就是本地日；
+  // 对应的 UTC 时刻是 03-19T16:30Z，确认我们输出的不是 UTC。
+  assert.equal(expanded[0].instance_start, '2026-03-20T00:30:00');
+  assert.equal(new Date(parseShanghai(expanded[0].instance_start)).toISOString(), '2026-03-19T16:30:00.000Z');
 });
 
 test('timezone: 周界（周日→周一）按 Asia/Shanghai 计算 weekday 与学期周', () => {
@@ -226,8 +234,121 @@ test('非重复事件也带 instance_start/instance_end', () => {
     new Date('2026-03-25T23:59:59.999Z'),
   );
   assert.equal(expanded.length, 1);
-  assert.equal(expanded[0].instance_start, expanded[0].start_time);
-  assert.equal(expanded[0].instance_end, expanded[0].end_time);
+  // 母值是带 Z 的 ISO（这个 fixture 如此），实例是裸上海格式 —— 指同一时刻。
+  assert.equal(parseShanghai(expanded[0].instance_start), new Date(expanded[0].start_time).getTime());
+  assert.equal(parseShanghai(expanded[0].instance_end), new Date(expanded[0].end_time).getTime());
+  assert.equal(expanded[0].instance_start, '2026-03-19T16:00:00', '08:00Z = 上海 16:00');
+});
+
+/* ---------- 合约第 20 条：floating Asia/Shanghai 业务时间语义 ---------- */
+
+test('parseShanghai: 裸格式按上海钟点解释，不看进程时区', () => {
+  // 生产实测形态：whut-import 导入的真课表就是这个样子
+  assert.equal(new Date(parseShanghai('2026-09-08T08:00:00')).toISOString(), '2026-09-08T00:00:00.000Z');
+  // 若误用 new Date(裸串)，TZ=UTC 下会得到 08:00Z —— 正是把 14:00 的课显示成 22:00 的根源
+  assert.notEqual(parseShanghai('2026-09-08T08:00:00'), Date.UTC(2026, 8, 8, 8, 0, 0));
+});
+
+test('parseShanghai: 四种输入形态归一到同一时刻', () => {
+  const expected = Date.UTC(2026, 8, 8, 6, 0, 0); // 上海 14:00 = 06:00Z
+  assert.equal(parseShanghai('2026-09-08T14:00:00'), expected, '裸格式');
+  assert.equal(parseShanghai('2026-09-08T06:00:00Z'), expected, '带 Z');
+  assert.equal(parseShanghai('2026-09-08T14:00:00+08:00'), expected, '带 offset');
+  assert.equal(parseShanghai('2026-09-08T14:00:00.000'), expected, '裸格式带毫秒');
+  assert.equal(parseShanghai('2026-09-08T06:00:00.000Z'), expected, '带 Z 带毫秒');
+  assert.equal(parseShanghai('2026-09-08T15:00:00+09:00'), expected, '别的时区偏移');
+});
+
+test('formatShanghaiDateTime: 各种输入都规范化成裸上海格式', () => {
+  assert.equal(formatShanghaiDateTime('2026-09-08T06:00:00Z'), '2026-09-08T14:00:00', '带 Z → 上海钟点');
+  assert.equal(formatShanghaiDateTime('2026-09-08T14:00:00+08:00'), '2026-09-08T14:00:00', '带 offset');
+  assert.equal(formatShanghaiDateTime('2026-09-08T14:00:00'), '2026-09-08T14:00:00', '裸格式原样');
+  assert.equal(formatShanghaiDateTime('2026-09-08T14:00:00.500'), '2026-09-08T14:00:00', '毫秒被抹平');
+  assert.equal(formatShanghaiDateTime('2026-09-08T15:00:00+09:00'), '2026-09-08T14:00:00', '换算别的时区');
+  assert.equal(formatShanghaiDateTime('不是时间'), null, '解析不了返回 null');
+});
+
+test('parseShanghai: 纯日期按上海当日 00:00', () => {
+  assert.equal(new Date(parseShanghai('2026-09-08')).toISOString(), '2026-09-07T16:00:00.000Z');
+});
+
+test('parseShanghai: 拒绝会被 Date.UTC 静默滚动的非法日期和钟点', () => {
+  for (const value of [
+    '2026-02-30',
+    '2026-02-30T14:00:00',
+    '2026-09-08T25:00:00',
+    '2026-09-08T14:60:00',
+    '2026-09-08T14:00:60',
+  ]) {
+    assert.ok(Number.isNaN(parseShanghai(value)), `${value} 应被拒绝`);
+  }
+});
+
+test('生产回归：上海 14:00 的课不会被平移成 22:00', () => {
+  // Iris 真实数据形态：卫星导航原理 start_time: 2026-09-08T08:00:00（真实是上海 8 点）
+  const events = [createRepeatingEvent({
+    id: 'satnav', title: '卫星导航原理', repeat: 'none',
+    start_time: '2026-09-08T14:00:00',
+    end_time: '2026-09-08T15:40:00',
+  })];
+  const expanded = expandRepeatingEvents(
+    events, shanghaiDayStart('2026-09-08'), shanghaiDayEnd('2026-09-08'),
+  );
+  assert.equal(expanded.length, 1);
+  assert.equal(expanded[0].instance_start, '2026-09-08T14:00:00', '显示就是 14:00，不是 22:00');
+  assert.equal(expanded[0].instance_end, '2026-09-08T15:40:00');
+});
+
+test('混合格式：裸 / 带 Z / 带 offset / 带毫秒的课在同一天并存且排序正确', () => {
+  const events = [
+    createRepeatingEvent({ id: 'naive', repeat: 'none', start_time: '2026-09-08T14:00:00', end_time: '2026-09-08T15:00:00' }),
+    createRepeatingEvent({ id: 'zulu', repeat: 'none', start_time: '2026-09-08T00:00:00Z', end_time: '2026-09-08T01:00:00Z' }),
+    createRepeatingEvent({ id: 'offset', repeat: 'none', start_time: '2026-09-08T10:00:00+08:00', end_time: '2026-09-08T11:00:00+08:00' }),
+    createRepeatingEvent({ id: 'millis', repeat: 'none', start_time: '2026-09-08T12:00:00.250', end_time: '2026-09-08T13:00:00.750' }),
+  ];
+  const expanded = expandRepeatingEvents(
+    events, shanghaiDayStart('2026-09-08'), shanghaiDayEnd('2026-09-08'),
+  );
+  expanded.sort((a, b) => a.instance_start.localeCompare(b.instance_start));
+  assert.deepEqual(
+    expanded.map((e) => [e.id, e.instance_start]),
+    [
+      ['zulu', '2026-09-08T08:00:00'],    // 00:00Z = 上海 08:00
+      ['offset', '2026-09-08T10:00:00'],
+      ['millis', '2026-09-08T12:00:00'],
+      ['naive', '2026-09-08T14:00:00'],
+    ],
+  );
+});
+
+test('混合格式：跨午夜课（裸格式）归到起始本地日', () => {
+  const events = [createRepeatingEvent({
+    id: 'night', repeat: 'daily', repeat_until: '2026-09-09',
+    start_time: '2026-09-08T23:00:00',
+    end_time: '2026-09-09T01:00:00',
+  })];
+  const expanded = expandRepeatingEvents(
+    events, shanghaiDayStart('2026-09-08'), shanghaiDayEnd('2026-09-10'),
+  );
+  assert.deepEqual(
+    expanded.map((e) => e.instance_start),
+    ['2026-09-08T23:00:00', '2026-09-09T23:00:00'],
+  );
+  // 每节都跨本地午夜，且 repeat_until 按本地日卡
+  assert.equal(expanded[0].instance_end, '2026-09-09T01:00:00');
+});
+
+test('repeat_until 对裸格式课程按上海本地日生效', () => {
+  const events = [createRepeatingEvent({
+    id: 'late', repeat: 'daily', repeat_until: '2026-09-09',
+    start_time: '2026-09-08T23:30:00',
+    end_time: '2026-09-08T23:59:00',
+  })];
+  const expanded = expandRepeatingEvents(
+    events, shanghaiDayStart('2026-09-08'), shanghaiDayEnd('2026-09-12'),
+  );
+  // 本地 9/8、9/9 两节；若按 UTC 日判定（15:30Z / 9-8）会多放一节
+  assert.deepEqual(expanded.map((e) => e.instance_start.slice(0, 10)), ['2026-09-08', '2026-09-09']);
 });
 
 /* ---------- Asia/Shanghai 辅助函数 ---------- */

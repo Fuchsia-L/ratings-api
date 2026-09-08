@@ -169,10 +169,11 @@ test('POST 课程：撞上 weekly 重复课的展开实例 → 409', async (t) =
   assert.equal(conflicts.length, 1);
   assert.equal(conflicts[0].id, 'weekly-math');
   assert.equal(
-    conflicts[0].instance_start, '2026-09-14T00:00:00.000Z',
-    '报的是 9/14 那个实例的时间（08:00+08 = 00:00Z），不是母事件 9/7 的时间',
+    conflicts[0].instance_start, '2026-09-14T08:00:00',
+    '报的是 9/14 那个实例的时间（裸上海钟点），不是母事件 9/7 的时间',
   );
-  assert.equal(conflicts[0].start_time, '2026-09-07T08:00:00.000+08:00', '母事件时间原样保留');
+  // 写入时 +08:00 的输入已被规范化成裸上海格式存储（合约第 20 条）
+  assert.equal(conflicts[0].start_time, '2026-09-07T08:00:00', '母事件时间保持母值');
 });
 
 test('POST 课程：weekly 重复课在 repeat_until 之后不再算冲突', async (t) => {

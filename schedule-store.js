@@ -1,7 +1,14 @@
 /**
  * schedule_events / todos / config 三张新表的 schema、校验、LWW upsert。
  * 同步语义逐条对齐 ratings 表：LWW upsert、tombstone 软删、expected_updated_at 乐观并发。
+ *
+ * 时间字段两套语义（合约第 20 条）：
+ * - 业务时间 start_time / end_time / repeat_until / last_reset —— floating Asia/Shanghai，
+ *   规范存储裸格式；输入容忍带 Z / 带 offset / 带毫秒，入库前换算并规范化。
+ * - 同步字段 created_at / updated_at / synced_at / deleted_at —— 真 UTC 毫秒 ISO，不动。
  */
+
+import { parseShanghai, formatShanghaiDateTime, formatShanghaiDate } from './schedule-domain.js';
 
 export const CATEGORY_KEYS = ['学习', '工作', '生活', '运动', '娱乐', '其他'];
 export const REPEAT_TYPES = ['none', 'daily', 'weekly'];
@@ -181,8 +188,31 @@ export function readLastPush(store, kind) {
   return store.meta.get.get(LAST_PUSH_KEYS[kind])?.value ?? null;
 }
 
-function isIsoish(value) {
-  return typeof value === 'string' && value.length > 0 && !Number.isNaN(Date.parse(value));
+/**
+ * 业务时间字段（start_time / end_time / repeat_until / last_reset）是
+ * **floating Asia/Shanghai** 语义（合约第 20 条）：规范存储裸格式 `YYYY-MM-DDTHH:mm:ss`。
+ * 输入容忍裸格式 / 带 Z / 带 offset / 带毫秒，一律换算成上海钟点后规范化再存。
+ * 同步字段（created_at 等）不走这套，仍是真 UTC 毫秒 ISO。
+ */
+function isBusinessTime(value) {
+  return typeof value === 'string' && Number.isFinite(parseShanghai(value));
+}
+
+/** 业务日期字段（repeat_until / last_reset）：容忍带时区输入，规范化成上海自然日。 */
+function isBusinessDate(value) {
+  return typeof value === 'string' && Number.isFinite(parseShanghai(value));
+}
+
+/** 规范化成裸上海时刻；解析不了就原样退回（校验阶段已挡住非法值）。 */
+function canonTime(value) {
+  return formatShanghaiDateTime(value) ?? value;
+}
+
+/** 规范化成上海自然日 `YYYY-MM-DD`。 */
+function canonDate(value) {
+  if (value == null) return null;
+  const ms = parseShanghai(value);
+  return Number.isFinite(ms) ? formatShanghaiDate(ms) : value;
 }
 
 export function validateScheduleEvent(r) {
@@ -191,12 +221,16 @@ export function validateScheduleEvent(r) {
   if (typeof r.title !== 'string' || !r.title) return 'title required';
   if (r.title.length > MAX_TITLE) return `title must be string <= ${MAX_TITLE}`;
   if (!CATEGORY_KEYS.includes(r.category)) return `category must be one of ${CATEGORY_KEYS.join('/')}`;
-  if (!isIsoish(r.start_time)) return 'start_time must be ISO datetime string';
-  if (!isIsoish(r.end_time)) return 'end_time must be ISO datetime string';
+  if (!isBusinessTime(r.start_time)) {
+    return 'start_time must be YYYY-MM-DDTHH:mm:ss (Asia/Shanghai) or a zoned ISO datetime';
+  }
+  if (!isBusinessTime(r.end_time)) {
+    return 'end_time must be YYYY-MM-DDTHH:mm:ss (Asia/Shanghai) or a zoned ISO datetime';
+  }
   const repeat = r.repeat ?? 'none';
   if (!REPEAT_TYPES.includes(repeat)) return `repeat must be one of ${REPEAT_TYPES.join('/')}`;
-  if (r.repeat_until != null && !/^\d{4}-\d{2}-\d{2}$/.test(r.repeat_until)) {
-    return 'repeat_until must be YYYY-MM-DD if provided';
+  if (r.repeat_until != null && !isBusinessDate(r.repeat_until)) {
+    return 'repeat_until must be YYYY-MM-DD (Asia/Shanghai) if provided';
   }
   if (r.location != null && (typeof r.location !== 'string' || r.location.length > MAX_LOCATION)) {
     return `location must be string <= ${MAX_LOCATION}`;
@@ -229,10 +263,11 @@ export function normalizeScheduleEvent(r) {
     id: r.id,
     title: r.title,
     category: r.category,
-    start_time: r.start_time,
-    end_time: r.end_time,
+    // 规范化：带 Z / 带 offset / 带毫秒的输入在这里被换算成上海钟点并抹平成裸格式。
+    start_time: canonTime(r.start_time),
+    end_time: canonTime(r.end_time),
     repeat: r.repeat ?? 'none',
-    repeat_until: r.repeat_until ?? null,
+    repeat_until: canonDate(r.repeat_until ?? null),
     location: r.location ?? null,
     reminder_minutes: r.reminder_minutes ?? null,
     notes: r.notes ?? null,
@@ -266,6 +301,9 @@ export function validateTodo(r) {
     return 'is_completed must be boolean';
   }
   if (typeof r.last_reset !== 'string' || !r.last_reset) return 'last_reset required';
+  if (!isBusinessDate(r.last_reset)) {
+    return 'last_reset must be YYYY-MM-DD (Asia/Shanghai)';
+  }
   if (r.notes != null && (typeof r.notes !== 'string' || r.notes.length > MAX_NOTES)) {
     return `notes must be string <= ${MAX_NOTES}`;
   }
@@ -287,7 +325,7 @@ export function normalizeTodo(r) {
     type: r.type,
     priority: r.priority,
     is_completed: r.is_completed ? 1 : 0,
-    last_reset: r.last_reset,
+    last_reset: canonDate(r.last_reset),
     notes: r.notes ?? null,
     created_at: r.created_at,
     updated_at: r.updated_at,

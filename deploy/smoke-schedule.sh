@@ -61,16 +61,16 @@ say "推 3 门课（含 weekly 重复 + 跨午夜）"
 curl -fsS -X POST "${sync_hdr[@]}" -d @- "$HOST/v1/schedule/sync" <<EOF | jget "d['applied']" | grep -qx 3 || die "课程同步 applied != 3"
 {"records":[
  {"id":"smoke-math","title":"高等数学","category":"学习",
-  "start_time":"${MONDAY}T08:00:00.000+08:00","end_time":"${MONDAY}T09:40:00.000+08:00",
+  "start_time":"${MONDAY}T08:00:00","end_time":"${MONDAY}T09:40:00",
   "repeat":"weekly","repeat_until":"2026-12-31","location":"教三 401","reminder_minutes":15,
   "source":"manual","is_completed":false,
   "created_at":"$NOW","updated_at":"$NOW","synced_at":null,"schema_version":1},
  {"id":"smoke-gym","title":"游泳","category":"运动",
-  "start_time":"${MONDAY}T18:00:00.000+08:00","end_time":"${MONDAY}T19:00:00.000+08:00",
+  "start_time":"${MONDAY}T18:00:00","end_time":"${MONDAY}T19:00:00",
   "repeat":"none","is_completed":false,
   "created_at":"$NOW","updated_at":"$NOW","synced_at":null,"schema_version":1},
  {"id":"smoke-night","title":"夜间自习","category":"学习",
-  "start_time":"${MONDAY}T23:00:00.000+08:00","end_time":"2026-09-08T01:00:00.000+08:00",
+  "start_time":"${MONDAY}T23:00:00","end_time":"2026-09-08T01:00:00",
   "repeat":"none","is_completed":false,
   "created_at":"$NOW","updated_at":"$NOW","synced_at":null,"schema_version":1}
 ]}
@@ -114,16 +114,45 @@ DAY_JSON=$(curl -fsS "${ro_hdr[@]}" "$HOST/v1/schedule/day?date=$MONDAY")
 [ "$(echo "$DAY_JSON" | jget "len(d['todos'])")" = "2" ]  || die "当天应有 2 条待办"
 [ "$(echo "$DAY_JSON" | jget "d['events'][0]['id']")" = "smoke-math" ] || die "首节课应是 smoke-math"
 [ "$(echo "$DAY_JSON" | jget "d['events'][0]['ratings'][0]['rating']")" = "4" ] || die "评分未关联上"
-[ "$(echo "$DAY_JSON" | jget "d['events'][0]['start_time']")" = "${MONDAY}T08:00:00.000+08:00" ] \
-  || die "母事件 start_time 应保持母值"
-echo "$DAY_JSON" | jget "d['events'][0]['instance_start']" | grep -q '^2026-09-07T00:00:00' \
-  || die "instance_start 应为 UTC 2026-09-07T00:00（= +08 08:00）"
+[ "$(echo "$DAY_JSON" | jget "d['events'][0]['start_time']")" = "${MONDAY}T08:00:00" ] \
+  || die "母事件 start_time 应保持母值（裸上海格式）"
+# 合约第 20 条：业务时间是 floating Asia/Shanghai，实例时间直读就是本地钟点。
+[ "$(echo "$DAY_JSON" | jget "d['events'][0]['instance_start']")" = "${MONDAY}T08:00:00" ] \
+  || die "instance_start 应为裸上海 08:00，不能被平移"
 # last_synced 是服务端记的「最后一次收到同步请求」，不是记录里的 synced_at
 # （app 推 pending 记录时 synced_at 恒为 null，服务端永远看不到非 null 值）。
 echo "$DAY_JSON" | jget "d['last_synced']['schedule'] or ''" | grep -q '^2' \
   || die "last_synced.schedule 应有服务端记录的推送时刻"
 echo "$DAY_JSON" | jget "d['last_synced']['todos'] or ''" | grep -q '^2' \
   || die "last_synced.todos 应有服务端记录的推送时刻"
+ok
+
+say "时区回归：裸格式「上海 14:00」与带 Z「06:00Z」都显示 14:00（合约第 20 条）"
+curl -fsS -X POST "${sync_hdr[@]}" -d @- "$HOST/v1/schedule/sync" >/dev/null <<EOF
+{"records":[
+ {"id":"smoke-tz-naive","title":"C++(裸格式)","category":"学习",
+  "start_time":"2026-09-10T14:00:00","end_time":"2026-09-10T15:40:00",
+  "repeat":"none","is_completed":false,
+  "created_at":"$NOW","updated_at":"$NOW","synced_at":null,"schema_version":1},
+ {"id":"smoke-tz-zulu","title":"C++(带 Z)","category":"学习",
+  "start_time":"2026-09-10T06:00:00Z","end_time":"2026-09-10T07:40:00Z",
+  "repeat":"none","is_completed":false,
+  "created_at":"$NOW","updated_at":"$NOW","synced_at":null,"schema_version":1},
+ {"id":"smoke-tz-offset","title":"C++(带 offset 带毫秒)","category":"学习",
+  "start_time":"2026-09-10T14:00:00.250+08:00","end_time":"2026-09-10T15:40:00.750+08:00",
+  "repeat":"none","is_completed":false,
+  "created_at":"$NOW","updated_at":"$NOW","synced_at":null,"schema_version":1}
+]}
+EOF
+TZ_JSON=$(curl -fsS "${ro_hdr[@]}" "$HOST/v1/schedule/day?date=2026-09-10")
+for id in smoke-tz-naive smoke-tz-zulu smoke-tz-offset; do
+  got=$(echo "$TZ_JSON" | jget "[e['instance_start'] for e in d['events'] if e['id']=='$id'][0]")
+  [ "$got" = "2026-09-10T14:00:00" ] || die "$id 应显示 14:00，得到 $got（时区平移 bug 回归）"
+done
+# 库里存的一律是规范化后的裸格式
+[ "$(curl -fsS -H "Authorization: Bearer $SYNC_TOKEN" "$HOST/v1/schedule" \
+     | jget "[r['start_time'] for r in d['records'] if r['id']=='smoke-tz-zulu'][0]")" = "2026-09-10T14:00:00" ] \
+  || die "带 Z 的输入应被规范化成裸上海格式存储"
 ok
 
 say "last_synced 不受记录里 synced_at=null 影响（合约缺陷回归）"
@@ -152,10 +181,10 @@ ok
 
 say "时间点查询：上课中命中、课间落空"
 HIT=$(curl -fsS "${ro_hdr[@]}" \
-  "$HOST/v1/schedule/window?start=2026-09-07T08:30:00.000%2B08:00&end=2026-09-07T08:30:00.000%2B08:00")
+  "$HOST/v1/schedule/window?start=2026-09-07T08:30:00&end=2026-09-07T08:30:00")
 [ "$(echo "$HIT" | jget "len(d['events'])")" = "1" ] || die "08:30 应正在上高数"
 MISS=$(curl -fsS "${ro_hdr[@]}" \
-  "$HOST/v1/schedule/window?start=2026-09-07T12:00:00.000%2B08:00&end=2026-09-07T12:00:00.000%2B08:00")
+  "$HOST/v1/schedule/window?start=2026-09-07T12:00:00&end=2026-09-07T12:00:00")
 [ "$(echo "$MISS" | jget "len(d['events'])")" = "0" ] || die "12:00 应没课"
 ok
 
@@ -186,7 +215,7 @@ sleep 1
 curl -fsS -X POST "${sync_hdr[@]}" -d @- "$HOST/v1/schedule/sync" <<EOF | jget "d['applied']" | grep -qx 1 || die "改课未写入"
 {"records":[
  {"id":"smoke-gym","title":"游泳(改到 20:00)","category":"运动",
-  "start_time":"${MONDAY}T20:00:00.000+08:00","end_time":"${MONDAY}T21:00:00.000+08:00",
+  "start_time":"${MONDAY}T20:00:00","end_time":"${MONDAY}T21:00:00",
   "repeat":"none","is_completed":false,
   "created_at":"$NOW","updated_at":"2026-09-05T00:00:00.000Z","synced_at":null,"schema_version":1}]}
 EOF
@@ -209,7 +238,7 @@ say "tombstone：软删一门课后 day 里消失"
 curl -fsS -X POST "${sync_hdr[@]}" -d @- "$HOST/v1/schedule/sync" <<EOF >/dev/null
 {"records":[
  {"id":"smoke-gym","title":"游泳(改到 20:00)","category":"运动",
-  "start_time":"${MONDAY}T20:00:00.000+08:00","end_time":"${MONDAY}T21:00:00.000+08:00",
+  "start_time":"${MONDAY}T20:00:00","end_time":"${MONDAY}T21:00:00",
   "repeat":"none","is_completed":false,
   "created_at":"$NOW","updated_at":"2026-09-06T00:00:00.000Z","synced_at":null,
   "deleted_at":"2026-09-06T00:00:00.000Z","schema_version":1}]}
@@ -225,11 +254,11 @@ say "校验拒绝：非法 category 单条 rejected，同批好记录照写"
 REJ=$(curl -fsS -X POST "${sync_hdr[@]}" -d @- "$HOST/v1/schedule/sync" <<EOF
 {"records":[
  {"id":"smoke-bad","title":"摸鱼","category":"不存在的分类",
-  "start_time":"${MONDAY}T10:00:00.000+08:00","end_time":"${MONDAY}T11:00:00.000+08:00",
+  "start_time":"${MONDAY}T10:00:00","end_time":"${MONDAY}T11:00:00",
   "repeat":"none","is_completed":false,
   "created_at":"$NOW","updated_at":"$NOW","schema_version":1},
  {"id":"smoke-ok","title":"英语","category":"学习",
-  "start_time":"${MONDAY}T10:00:00.000+08:00","end_time":"${MONDAY}T11:00:00.000+08:00",
+  "start_time":"${MONDAY}T10:00:00","end_time":"${MONDAY}T11:00:00",
   "repeat":"none","is_completed":false,
   "created_at":"$NOW","updated_at":"$NOW","schema_version":1}]}
 EOF
@@ -258,7 +287,7 @@ ok
 say "写端点：WRITE_TOKEN 新增一门课（201，服务端补 id/时间戳/source）"
 ADD=$(curl -fsS -X POST "${write_hdr[@]}" -d @- "$HOST/v1/schedule/events" <<EOF
 {"title":"Claude 加的课","category":"学习",
- "start_time":"${MONDAY}T12:00:00.000+08:00","end_time":"${MONDAY}T13:00:00.000+08:00",
+ "start_time":"${MONDAY}T12:00:00","end_time":"${MONDAY}T13:00:00",
  "location":"图书馆"}
 EOF
 )
@@ -278,7 +307,7 @@ say "写端点：撞车的新增 → 409 conflict，报出撞的是哪一节"
 CONFLICT=$(curl -sS -o /tmp/smoke-conflict.$$ -w '%{http_code}' -X POST "${write_hdr[@]}" -d @- \
   "$HOST/v1/schedule/events" <<EOF
 {"title":"想插队的课","category":"学习",
- "start_time":"${MONDAY}T12:30:00.000+08:00","end_time":"${MONDAY}T13:30:00.000+08:00"}
+ "start_time":"${MONDAY}T12:30:00","end_time":"${MONDAY}T13:30:00"}
 EOF
 )
 [ "$CONFLICT" = "409" ] || die "撞车应返回 409，实际 $CONFLICT"
@@ -295,7 +324,7 @@ NEXT_MONDAY="2026-09-14"
 W_CONFLICT=$(curl -sS -o /tmp/smoke-wconf.$$ -w '%{http_code}' -X POST "${write_hdr[@]}" -d @- \
   "$HOST/v1/schedule/events" <<EOF
 {"title":"撞高数展开实例","category":"学习",
- "start_time":"${NEXT_MONDAY}T08:30:00.000+08:00","end_time":"${NEXT_MONDAY}T09:00:00.000+08:00"}
+ "start_time":"${NEXT_MONDAY}T08:30:00","end_time":"${NEXT_MONDAY}T09:00:00"}
 EOF
 )
 [ "$W_CONFLICT" = "409" ] || die "撞重复课实例应 409，实际 $W_CONFLICT"
@@ -381,7 +410,7 @@ ok
 say "写端点：校验错 400（非法 category）"
 VE=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "${write_hdr[@]}" -d @- "$HOST/v1/schedule/events" <<EOF
 {"title":"摸鱼","category":"不存在的分类",
- "start_time":"${MONDAY}T15:00:00.000+08:00","end_time":"${MONDAY}T16:00:00.000+08:00"}
+ "start_time":"${MONDAY}T15:00:00","end_time":"${MONDAY}T16:00:00"}
 EOF
 )
 [ "$VE" = "400" ] || die "非法 category 应 400，实际 $VE"

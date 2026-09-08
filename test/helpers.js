@@ -35,8 +35,10 @@ export function scheduleEvent(overrides = {}) {
     id: 'evt-1',
     title: '高等数学',
     category: '学习',
-    start_time: '2026-09-07T08:00:00.000+08:00',
-    end_time: '2026-09-07T09:40:00.000+08:00',
+    // app（whut-import）推的真实形态：裸本地 Asia/Shanghai 钟点，无 Z 无毫秒。
+    // fixture 别比生产干净——这里写成裸格式才能兜住时区 bug。
+    start_time: '2026-09-07T08:00:00',
+    end_time: '2026-09-07T09:40:00',
     repeat: 'weekly',
     repeat_until: '2026-12-31',
     location: '教三 401',
