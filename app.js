@@ -5,12 +5,50 @@ import { dirname } from 'node:path';
 import { buildSummary, parseSummaryDays } from './summary.js';
 import { createStore, runSync, validateSemester, readSemester, markPushed } from './schedule-store.js';
 import { buildDay, buildWindow, validateWindow, DATE_RE } from './schedule-query.js';
+import {
+  createAuditWriter,
+  buildCreateRecord,
+  buildPatchRecord,
+  buildTombstone,
+  touchesTimeFields,
+  findConflicts,
+  readExpectedUpdatedAt,
+} from './schedule-write.js';
 
 /**
  * 只读端点白名单：READONLY_TOKEN 只能碰这两个（设计 §3）。
  * SYNC_TOKEN 能碰全部 /v1。
  */
 const READONLY_PATHS = new Set(['/v1/schedule/day', '/v1/schedule/window']);
+
+/**
+ * WRITE_TOKEN 能碰的路径（设计 §A.1 权限矩阵）：写端点 + 查询端点 + 单条读。
+ * 同步端点（app 的批量 LWW 推送）和 pull 端点不给——那是手机的活，
+ * 拿写 token 去推整批记录会绕开这里的服务端时间戳权威与 audit。
+ *
+ * 精确路径用 Set，带 :id 的用前缀匹配。
+ */
+const WRITE_TOKEN_PATHS = new Set([
+  '/v1/schedule/day',
+  '/v1/schedule/window',
+  '/v1/schedule/events',
+]);
+const WRITE_TOKEN_PREFIXES = ['/v1/schedule/events/', '/v1/todos/'];
+
+/**
+ * 同步端点是 app 的地盘，写 token 一律挡在门外。
+ * 单列出来是因为 `/v1/todos/sync` 恰好落在 `/v1/todos/` 前缀里——
+ * 光靠前缀匹配会把批量推送的门也一起开了。
+ */
+const SYNC_ONLY_PATHS = new Set(['/v1/schedule/sync', '/v1/todos/sync']);
+
+function writeTokenMayAccess(path, method) {
+  if (SYNC_ONLY_PATHS.has(path)) return false;
+  // POST /v1/todos 是写端点；GET /v1/todos 是 app 的 pull 端点，不给。
+  if (path === '/v1/todos') return method === 'POST';
+  if (WRITE_TOKEN_PATHS.has(path)) return true;
+  return WRITE_TOKEN_PREFIXES.some((prefix) => path.startsWith(prefix));
+}
 
 export function openDatabase(dbPath) {
   if (dbPath !== ':memory:') mkdirSync(dirname(dbPath), { recursive: true });
@@ -109,10 +147,13 @@ function normalize(r) {
  * @param {import('better-sqlite3').Database} opts.db
  * @param {string} opts.syncToken
  * @param {string} [opts.readonlyToken] 缺失 = 只读端点对 READONLY_TOKEN 关闭（非 fatal）
+ * @param {string} [opts.writeToken] 缺失 = 写端点整体关闭（非 fatal，见 server.js）
  * @param {string} [opts.internalToken]
  */
-export function buildApp({ db, syncToken, readonlyToken, internalToken, logger = false, bodyLimit }) {
+export function buildApp({ db, syncToken, readonlyToken, writeToken, internalToken, logger = false, bodyLimit }) {
   const store = createStore(db);
+  const audit = createAuditWriter(db);
+  const writeEnabled = Boolean(writeToken && writeToken.length >= 32);
 
   const upsertStmt = db.prepare(`
     INSERT INTO ratings (
@@ -174,10 +215,19 @@ export function buildApp({ db, syncToken, readonlyToken, internalToken, logger =
       return reply.code(401).send({ error: 'unauthorized' });
     }
     const presented = auth.slice(7);
-    if (presented === syncToken) return;
-    if (readonlyToken && readonlyToken.length >= 32 && presented === readonlyToken) {
-      if (READONLY_PATHS.has(path)) return;
+    if (presented === syncToken) {
+      req.tokenKind = 'sync';
+      return;
+    }
+    if (writeEnabled && presented === writeToken) {
+      req.tokenKind = 'write';
+      if (writeTokenMayAccess(path, req.method)) return;
       // 认得这把钥匙，但这扇门不归它开。
+      return reply.code(403).send({ error: 'forbidden_for_write_token' });
+    }
+    if (readonlyToken && readonlyToken.length >= 32 && presented === readonlyToken) {
+      req.tokenKind = 'readonly';
+      if (READONLY_PATHS.has(path)) return;
       return reply.code(403).send({ error: 'forbidden_for_readonly_token' });
     }
     return reply.code(401).send({ error: 'unauthorized' });
@@ -348,6 +398,196 @@ export function buildApp({ db, syncToken, readonlyToken, internalToken, logger =
     const parsed = validateWindow(req.query.start, req.query.end);
     if (parsed.error) return reply.code(400).send({ error: parsed.error });
     return buildWindow(store, parsed.start, parsed.end);
+  });
+
+  /* ---------------- v3 写端点（WRITE_TOKEN / SYNC_TOKEN） ---------------- */
+
+  /**
+   * 写端点的公共骨架。
+   *
+   * 关键约定（设计 §A.2）：
+   *   - 服务端是时间戳权威：created_at/updated_at 一律用这里的 serverTime。
+   *   - 每次调用无论成败都往 audit_log 落一行，outcome 记录到底发生了什么。
+   *   - 校验走同步端点那套 entity.validate，错误信息与 app 推送时完全一致。
+   *
+   * @param {object} entity store.schedule 或 store.todos
+   * @param {string} endpointBase 记进 audit 的端点名
+   * @param {object} createDefaults POST 时的缺省字段
+   * @param {boolean} conflictCheck 是否跑冲突检测（只有课程要）
+   */
+  function registerWriteRoutes({ entity, endpointBase, createDefaults, conflictCheck }) {
+    /** 落 audit 并返回 reply，保证任何一条出口都留痕。 */
+    function done(req, reply, { code, body, recordId, outcome, payload }) {
+      audit({
+        tokenKind: req.tokenKind,
+        endpoint: endpointBase,
+        method: req.method,
+        recordId: recordId ?? null,
+        payload: payload ?? req.body ?? null,
+        outcome,
+      });
+      return reply.code(code).send(body);
+    }
+
+    /** 单条读：含软删记录（caller 要拿 expected_updated_at，墓碑也得看得见）。 */
+    fastify.get(`${endpointBase}/:id`, async (req, reply) => {
+      const row = entity.findById.get(req.params.id);
+      if (!row) return reply.code(404).send({ error: 'not_found' });
+      const record = entity.hydrate(row);
+      return {
+        record,
+        deleted: record.deleted_at != null,
+        server_time: new Date().toISOString(),
+      };
+    });
+
+    fastify.post(endpointBase, async (req, reply) => {
+      const serverTime = new Date().toISOString();
+      const body = req.body ?? {};
+      if (typeof body !== 'object' || Array.isArray(body)) {
+        return done(req, reply, {
+          code: 400, outcome: 'validation_error', body: { error: 'body must be object' },
+        });
+      }
+
+      const record = buildCreateRecord(body, serverTime, createDefaults);
+      const err = entity.validate(record);
+      if (err) {
+        return done(req, reply, {
+          code: 400, outcome: 'validation_error', recordId: record.id, body: { error: err },
+        });
+      }
+
+      // id 撞车：caller 自带 id 但库里已有（含墓碑）。让它显式走 PATCH，别悄悄覆盖。
+      if (entity.findById.get(record.id)) {
+        return done(req, reply, {
+          code: 409, outcome: 'conflict', recordId: record.id,
+          body: { error: 'id_exists', current_record: entity.hydrate(entity.findById.get(record.id)) },
+        });
+      }
+
+      if (conflictCheck) {
+        const conflicts = findConflicts(store, record);
+        if (conflicts.length > 0) {
+          return done(req, reply, {
+            code: 409, outcome: 'conflict', recordId: record.id,
+            body: { error: 'conflict', conflicts },
+          });
+        }
+      }
+
+      entity.force.run(entity.normalize(record));
+      const saved = entity.hydrate(entity.findById.get(record.id));
+      return done(req, reply, {
+        code: 201, outcome: 'created', recordId: record.id,
+        body: { record: saved, server_time: serverTime },
+      });
+    });
+
+    fastify.patch(`${endpointBase}/:id`, async (req, reply) => {
+      const serverTime = new Date().toISOString();
+      const id = req.params.id;
+      const body = req.body ?? {};
+      if (typeof body !== 'object' || Array.isArray(body)) {
+        return done(req, reply, {
+          code: 400, outcome: 'validation_error', recordId: id, body: { error: 'body must be object' },
+        });
+      }
+
+      const expected = readExpectedUpdatedAt(req);
+      if (!expected) {
+        return done(req, reply, {
+          code: 400, outcome: 'validation_error', recordId: id,
+          body: { error: 'expected_updated_at required' },
+        });
+      }
+
+      const row = entity.findById.get(id);
+      // 软删的记录当作不存在：改一条已经删掉的课没有意义，让 caller 重新建。
+      if (!row || row.deleted_at != null) {
+        return done(req, reply, { code: 404, outcome: 'not_found', recordId: id, body: { error: 'not_found' } });
+      }
+
+      const current = entity.hydrate(row);
+      if (current.updated_at !== expected) {
+        return done(req, reply, {
+          code: 409, outcome: 'stale', recordId: id,
+          body: { error: 'stale', current_record: current },
+        });
+      }
+
+      const merged = buildPatchRecord(current, body, serverTime);
+      const err = entity.validate(merged);
+      if (err) {
+        return done(req, reply, {
+          code: 400, outcome: 'validation_error', recordId: id, body: { error: err },
+        });
+      }
+
+      if (conflictCheck && touchesTimeFields(body)) {
+        const conflicts = findConflicts(store, merged);
+        if (conflicts.length > 0) {
+          return done(req, reply, {
+            code: 409, outcome: 'conflict', recordId: id, body: { error: 'conflict', conflicts },
+          });
+        }
+      }
+
+      entity.force.run(entity.normalize(merged));
+      const saved = entity.hydrate(entity.findById.get(id));
+      return done(req, reply, {
+        code: 200, outcome: 'updated', recordId: id,
+        body: { record: saved, server_time: serverTime },
+      });
+    });
+
+    fastify.delete(`${endpointBase}/:id`, async (req, reply) => {
+      const serverTime = new Date().toISOString();
+      const id = req.params.id;
+
+      const expected = readExpectedUpdatedAt(req);
+      if (!expected) {
+        return done(req, reply, {
+          code: 400, outcome: 'validation_error', recordId: id,
+          body: { error: 'expected_updated_at required' },
+        });
+      }
+
+      const row = entity.findById.get(id);
+      if (!row || row.deleted_at != null) {
+        return done(req, reply, { code: 404, outcome: 'not_found', recordId: id, body: { error: 'not_found' } });
+      }
+
+      const current = entity.hydrate(row);
+      if (current.updated_at !== expected) {
+        return done(req, reply, {
+          code: 409, outcome: 'stale', recordId: id,
+          body: { error: 'stale', current_record: current },
+        });
+      }
+
+      entity.force.run(entity.normalize(buildTombstone(current, serverTime)));
+      const saved = entity.hydrate(entity.findById.get(id));
+      return done(req, reply, {
+        code: 200, outcome: 'deleted', recordId: id,
+        body: { record: saved, server_time: serverTime },
+      });
+    });
+  }
+
+  registerWriteRoutes({
+    entity: store.schedule,
+    endpointBase: '/v1/schedule/events',
+    // source 缺省 'claude'：这些端点的调用方就是 Claude（设计 §A.2）。
+    createDefaults: { repeat: 'none', category: '学习', source: 'claude', is_completed: false },
+    conflictCheck: true,
+  });
+
+  registerWriteRoutes({
+    entity: store.todos,
+    endpointBase: '/v1/todos',
+    createDefaults: { type: 'daily', priority: 'medium', is_completed: false },
+    conflictCheck: false,
   });
 
   fastify.setErrorHandler((err, req, reply) => {

@@ -4,6 +4,7 @@ import { buildApp, initRatingsSchema } from '../app.js';
 export const SYNC_TOKEN = 'sync-token-for-tests-0123456789abcdef';
 export const READONLY_TOKEN = 'readonly-token-for-tests-0123456789abcd';
 export const INTERNAL_TOKEN = 'internal-token-for-tests-0123456789abcd';
+export const WRITE_TOKEN = 'write-token-for-tests-0123456789abcdefg';
 
 export function makeApp(opts = {}) {
   const db = new Database(':memory:');
@@ -12,10 +13,16 @@ export function makeApp(opts = {}) {
     db,
     syncToken: SYNC_TOKEN,
     readonlyToken: 'readonlyToken' in opts ? opts.readonlyToken : READONLY_TOKEN,
+    writeToken: 'writeToken' in opts ? opts.writeToken : WRITE_TOKEN,
     internalToken: INTERNAL_TOKEN,
     logger: false,
   });
   return { app, db };
+}
+
+/** audit_log 全部行（按 id 升序），给写端点测试断言留痕用。 */
+export function auditRows(db) {
+  return db.prepare('SELECT * FROM audit_log ORDER BY id').all();
 }
 
 export function auth(token = SYNC_TOKEN) {
