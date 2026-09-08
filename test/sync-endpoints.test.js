@@ -276,6 +276,89 @@ test('PUT /v1/config/semester 校验', async (t) => {
   assert.equal((await put({ start_date: '2026-09-01', total_weeks: 18 })).statusCode, 400);
 });
 
+test('PUT /v1/config/semester 接受 app 真实的 toISOString 格式（生产回归）', async (t) => {
+  const { app, db } = makeApp();
+  t.after(() => { app.close(); db.close(); });
+  // app 设置页发的就是 new Date('2026-08-31').toISOString()
+  // （klass2 useSettingsForm.ts）——老代码零改动，服务端负责收下并归一。
+  const res = await app.inject({
+    method: 'PUT', url: '/v1/config/semester', headers: auth(),
+    payload: { start_date: '2026-08-31T00:00:00.000Z', total_weeks: 18, updated_at: '2026-08-31T00:00:00.000Z' },
+  });
+  assert.equal(res.statusCode, 200, 'app 的真实 payload 不该被 400 拒掉');
+  assert.equal(res.json().applied, true);
+  assert.equal(res.json().semester.start_date, '2026-08-31', '响应回归一后的值');
+  // 库里落的也是裸日历日
+  assert.equal(
+    JSON.parse(db.prepare("SELECT value_json FROM config WHERE key='semester'").get().value_json).start_date,
+    '2026-08-31',
+  );
+});
+
+test('PUT /v1/config/semester 裸 YYYY-MM-DD 原样收下', async (t) => {
+  const { app, db } = makeApp();
+  t.after(() => { app.close(); db.close(); });
+  const res = await app.inject({
+    method: 'PUT', url: '/v1/config/semester', headers: auth(),
+    payload: { start_date: '2026-08-31', total_weeks: 18, updated_at: 'x' },
+  });
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.json().semester.start_date, '2026-08-31');
+});
+
+test('PUT /v1/config/semester zoned 跨日界按上海日历日归一', async (t) => {
+  const { app, db } = makeApp();
+  t.after(() => { app.close(); db.close(); });
+  // 2026-08-31T20:00:00Z = 上海 2026-09-01 04:00 → 归到 9/1
+  const res = await app.inject({
+    method: 'PUT', url: '/v1/config/semester', headers: auth(),
+    payload: { start_date: '2026-08-31T20:00:00Z', total_weeks: 18, updated_at: 'x' },
+  });
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.json().semester.start_date, '2026-09-01', 'zoned 按上海日历日，不是 UTC 日');
+});
+
+test('PUT /v1/config/semester naive datetime 取日期部分', async (t) => {
+  const { app, db } = makeApp();
+  t.after(() => { app.close(); db.close(); });
+  const res = await app.inject({
+    method: 'PUT', url: '/v1/config/semester', headers: auth(),
+    payload: { start_date: '2026-08-31T09:00:00', total_weeks: 18, updated_at: 'x' },
+  });
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.json().semester.start_date, '2026-08-31');
+});
+
+test('PUT /v1/config/semester 解析不了的 start_date 仍 400', async (t) => {
+  const { app, db } = makeApp();
+  t.after(() => { app.close(); db.close(); });
+  const put = (start_date) => app.inject({
+    method: 'PUT', url: '/v1/config/semester', headers: auth(),
+    payload: { start_date, total_weeks: 18, updated_at: 'x' },
+  });
+  for (const bad of ['2026/09/01', '不是日期', '', '九月一号', '2026-13-45T00:00:00.000Z']) {
+    const res = await put(bad);
+    assert.equal(res.statusCode, 400, `${JSON.stringify(bad)} 应被拒`);
+    assert.match(res.json().error, /start_date/);
+  }
+  assert.equal((await put(20260901)).statusCode, 400, '非字符串也拒');
+});
+
+test('semester 归一后 day 的 semester_week 算得对（端到端）', async (t) => {
+  const { app, db } = makeApp();
+  t.after(() => { app.close(); db.close(); });
+  // app 形态推入：学期从 2026-08-31（周一）起
+  await app.inject({
+    method: 'PUT', url: '/v1/config/semester', headers: auth(),
+    payload: { start_date: '2026-08-31T00:00:00.000Z', total_weeks: 18, updated_at: 'x' },
+  });
+  const week = async (d) => (await app.inject({ url: `/v1/schedule/day?date=${d}`, headers: auth() })).json().semester_week;
+  assert.equal(await week('2026-08-31'), 1, '开学当周');
+  assert.equal(await week('2026-09-06'), 1, '同周周日');
+  assert.equal(await week('2026-09-07'), 2, '下周一');
+  assert.equal(await week('2026-08-30'), null, '开学前');
+});
+
 test('GET /v1/config/semester 未设置时返回 null', async (t) => {
   const { app, db } = makeApp();
   t.after(() => { app.close(); db.close(); });

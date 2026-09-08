@@ -43,7 +43,12 @@ CyberSchedule TimeSlotRating 同步服务，部署在 `api.epoch0.org`。
   `expected_updated_at` 乐观并发、单条校验失败进 `rejected` 不影响同批其他行）
 - `GET /v1/schedule?since=`、`GET /v1/todos?since=` — 纯拉取，不 filter 软删（同 ratings，交给调用方决定）
 - `PUT /v1/config/semester` — body `{start_date, total_weeks, updated_at}`，`updated_at` 新者胜；
-  响应 `{applied, semester, server_time}`
+  响应 `{applied, semester, server_time}`（`semester.start_date` 是归一后的值）
+  - `start_date` 按业务日期收：裸 `YYYY-MM-DD`、zoned datetime（按上海日历日归一）、
+    naive datetime（取日期部分）都接受，入库统一成裸 `YYYY-MM-DD`；解析不了才 400。
+    app 设置页发的是 `new Date('2026-08-31').toISOString()` = `2026-08-31T00:00:00.000Z`，
+    **必须收下**——早先严格只认裸日期，把它 400 掉，而 app 是 fire-and-forget 吞掉了拒绝，
+    结果服务端永远没有学期配置，`semester_week` 恒 `null`。
 - `GET /v1/config/semester` — 未设置时 `semester` 为 `null`
 
 ### 查询端点（Claude / 未来其他 app 用）
@@ -130,7 +135,7 @@ app 的批量同步端点同样不落行（那是手机的日常动作，不是�
 
 | 类别 | 字段 | 语义 | 格式 |
 |---|---|---|---|
-| 业务时间 | `start_time`、`end_time`、`repeat_until`、`last_reset` | floating **Asia/Shanghai**（墙上钟点） | 裸本地 `YYYY-MM-DDTHH:mm:ss`（日期字段 `YYYY-MM-DD`） |
+| 业务时间 | `start_time`、`end_time`、`repeat_until`、`last_reset`、`config.semester.start_date` | floating **Asia/Shanghai**（墙上钟点） | 裸本地 `YYYY-MM-DDTHH:mm:ss`（日期字段 `YYYY-MM-DD`） |
 | 同步时间 | `created_at`、`updated_at`、`synced_at`、`deleted_at`、`last_synced` | 绝对时刻 | 真 UTC 毫秒 ISO `...Z` |
 
 业务时间的规范存储格式与 app 现状一致（whut-import 导入的真课表就是 `2026-09-08T08:00:00`，

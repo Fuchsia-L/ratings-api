@@ -360,12 +360,13 @@ export function buildApp({ db, syncToken, readonlyToken, writeToken, internalTok
 
   fastify.put('/v1/config/semester', async (req, reply) => {
     const body = req.body ?? {};
-    const err = validateSemester(body);
-    if (err) return reply.code(400).send({ error: err });
+    const { error, value } = validateSemester(body);
+    if (error) return reply.code(400).send({ error });
+    // value.start_date 已规范化为裸上海日历日（app 发的是 toISOString 形态）
     const info = store.config.upsert.run({
       key: 'semester',
-      value_json: JSON.stringify({ start_date: body.start_date, total_weeks: body.total_weeks }),
-      updated_at: body.updated_at,
+      value_json: JSON.stringify({ start_date: value.start_date, total_weeks: value.total_weeks }),
+      updated_at: value.updated_at,
     });
     return {
       applied: info.changes > 0,

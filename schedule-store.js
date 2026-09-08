@@ -387,16 +387,36 @@ export function runSync(db, entity, records) {
 /* semester config                                                     */
 /* ------------------------------------------------------------------ */
 
+/**
+ * 校验并规范化 PUT /v1/config/semester 的 body。
+ *
+ * `start_date` 是业务日期（合约第 20/21 条），语义 = Asia/Shanghai 日历日：
+ * - 裸 `YYYY-MM-DD` —— 直接收
+ * - zoned datetime —— 按其声明时区换算成上海日历日
+ *   （app 设置页发的就是 `new Date('2026-08-31').toISOString()`
+ *    = `2026-08-31T00:00:00.000Z`，老代码按零改动原则不动，服务端负责收）
+ * - naive datetime —— 取其日期部分（本就是上海钟点）
+ * 解析不了仍然 400。
+ *
+ * 返回 `{ error }` 或 `{ value }`（value.start_date 已规范化为裸 `YYYY-MM-DD`），
+ * 让调用方不可能拿到未规范化的原值 —— 校验与规范化绑在一起，不会哪天各走各的。
+ */
 export function validateSemester(body) {
-  if (typeof body !== 'object' || body === null) return 'body must be object';
-  if (typeof body.start_date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(body.start_date)) {
-    return 'start_date must be YYYY-MM-DD';
+  if (typeof body !== 'object' || body === null) return { error: 'body must be object' };
+  if (typeof body.start_date !== 'string' || !body.start_date) {
+    return { error: 'start_date required' };
+  }
+  const startDate = canonDate(body.start_date);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(startDate ?? '')) {
+    return { error: 'start_date must be YYYY-MM-DD (Asia/Shanghai) or a parseable datetime' };
   }
   if (!Number.isInteger(body.total_weeks) || body.total_weeks < 1 || body.total_weeks > 60) {
-    return 'total_weeks must be integer 1-60';
+    return { error: 'total_weeks must be integer 1-60' };
   }
-  if (typeof body.updated_at !== 'string' || !body.updated_at) return 'updated_at required';
-  return null;
+  if (typeof body.updated_at !== 'string' || !body.updated_at) {
+    return { error: 'updated_at required' };
+  }
+  return { value: { start_date: startDate, total_weeks: body.total_weeks, updated_at: body.updated_at } };
 }
 
 export function readSemester(store) {

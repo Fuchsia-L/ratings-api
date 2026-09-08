@@ -90,10 +90,20 @@ curl -fsS -X POST "${sync_hdr[@]}" -d @- "$HOST/v1/todos/sync" <<EOF | jget "d['
 EOF
 ok
 
-say "推学期配置"
+say "推学期配置（app 真实形态：new Date(...).toISOString()）"
+# app 设置页发的就是 toISOString 形态，不是裸日期——种子别再比生产干净。
 curl -fsS -X PUT "${sync_hdr[@]}" \
-  -d '{"start_date":"2026-09-01","total_weeks":18,"updated_at":"2026-09-01T00:00:00.000Z"}' \
-  "$HOST/v1/config/semester" | grep -q '"applied":true' || die "学期配置没写进去"
+  -d '{"start_date":"2026-09-01T00:00:00.000Z","total_weeks":18,"updated_at":"2026-09-01T00:00:00.000Z"}' \
+  "$HOST/v1/config/semester" | grep -q '"applied":true' || die "学期配置没写进去（app 真实 payload 被拒？）"
+# 服务端应归一成裸上海日历日
+[ "$(curl -fsS "${sync_hdr[@]}" "$HOST/v1/config/semester" | jget "d['semester']['start_date']")" = "2026-09-01" ] \
+  || die "start_date 应归一为裸 YYYY-MM-DD"
+ok
+
+say "学期配置：解析不了的 start_date 仍 400"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT "${sync_hdr[@]}" \
+  -d '{"start_date":"2026/09/01","total_weeks":18,"updated_at":"x"}' "$HOST/v1/config/semester")
+[ "$code" = "400" ] || die "非法 start_date 应 400，得到 $code"
 ok
 
 say "推一条关联评分（linked_event_id=smoke-math）"
