@@ -231,6 +231,127 @@ test('todos/sync 接受三种 type 与三种 priority', async (t) => {
   assert.equal(res.json().rejected, 0);
 });
 
+/* ================= app 真实 payload 形态对齐（逐字段审计产物） ================= */
+
+test('payload 对齐: whut-import 生成的事件原样收下', async (t) => {
+  const { app, db } = makeApp();
+  t.after(() => { app.close(); db.close(); });
+  // 逐字段照 klass2 whut-import.ts:150-161 + events.service.ts:59-65 的落库形态。
+  // 注意 repeat_until / reminder_minutes 两个 key 压根不写 → wire 上缺席。
+  const record = {
+    id: 'whut-1',
+    title: '卫星导航原理',
+    category: '学习',                       // import 恒为「学习」
+    start_time: '2026-09-08T08:00:00',      // buildDateTime：本地朴素，无毫秒无 Z
+    end_time: '2026-09-08T09:40:00',
+    repeat: 'none',
+    location: '教三401',
+    notes: '教师：张三\n周次：第1周、第2周\n节次：第1-2节',
+    source: 'whut-import',
+    is_completed: false,
+    created_at: '2026-09-01T00:00:00.000Z',
+    updated_at: '2026-09-01T00:00:00.000Z',
+    synced_at: null,                        // 显式 null（待推）
+    deleted_at: null,                       // import 落库显式 null
+    // 无 schema_version：schedule/todo 侧根本没这个字段
+  };
+  const res = await post(app, '/v1/schedule/sync', { records: [record] });
+  assert.equal(res.json().rejected, 0, JSON.stringify(res.json().errors));
+  assert.equal(res.json().applied, 1);
+  const row = db.prepare("SELECT * FROM schedule_events WHERE id='whut-1'").get();
+  assert.equal(row.start_time, '2026-09-08T08:00:00', '朴素时间原样（已是规范格式）');
+  assert.equal(row.repeat_until, null, '缺席 → null');
+  assert.equal(row.reminder_minutes, null, '缺席 → null');
+  assert.equal(row.schema_version, 1, '服务端补默认值');
+});
+
+test('payload 对齐: location/notes 为 undefined 时 key 缺席也收下', async (t) => {
+  const { app, db } = makeApp();
+  t.after(() => { app.close(); db.close(); });
+  // JSON.stringify 会丢掉值为 undefined 的键（app 侧 EventSheet 的 `.trim() || undefined`
+  // 与 whut-import 的 item.location 都可能产出 undefined）
+  const record = JSON.parse(JSON.stringify({
+    id: 'no-loc', title: '自习', category: '学习',
+    start_time: '2026-09-08T19:00:00', end_time: '2026-09-08T21:00:00',
+    repeat: 'none', location: undefined, notes: undefined, reminder_minutes: undefined,
+    repeat_until: undefined, source: 'manual', is_completed: false,
+    created_at: '2026-09-01T00:00:00.000Z', updated_at: '2026-09-01T00:00:00.000Z',
+    synced_at: null, deleted_at: null,
+  }));
+  assert.ok(!('location' in record), 'undefined 的键确实消失了');
+  const res = await post(app, '/v1/schedule/sync', { records: [record] });
+  assert.equal(res.json().rejected, 0, JSON.stringify(res.json().errors));
+  const row = db.prepare("SELECT * FROM schedule_events WHERE id='no-loc'").get();
+  assert.equal(row.location, null);
+  assert.equal(row.notes, null);
+});
+
+test('payload 对齐: deleted_at 三态（缺席／显式 null／墓碑）等价处理', async (t) => {
+  const { app, db } = makeApp();
+  t.after(() => { app.close(); db.close(); });
+  const mk = (id, patch) => {
+    const r = { ...scheduleEvent({ id }), ...patch };
+    if (patch.__omitDeleted) { delete r.deleted_at; delete r.__omitDeleted; }
+    return r;
+  };
+  const res = await post(app, '/v1/schedule/sync', {
+    records: [
+      mk('absent', { __omitDeleted: true }),        // 懒升级老记录：键缺席
+      mk('explicit-null', { deleted_at: null }),    // 新建路径：显式 null
+      mk('tombstone', { deleted_at: '2026-09-02T00:00:00.000Z' }),
+    ],
+  });
+  assert.equal(res.json().rejected, 0, JSON.stringify(res.json().errors));
+  const get = (id) => db.prepare('SELECT deleted_at FROM schedule_events WHERE id=?').get(id).deleted_at;
+  assert.equal(get('absent'), null, '缺席应与显式 null 等价（都算活跃）');
+  assert.equal(get('explicit-null'), null);
+  assert.equal(get('tombstone'), '2026-09-02T00:00:00.000Z');
+  // 活跃判定用 IS NULL，两类记录不该分叉
+  const active = db.prepare('SELECT id FROM schedule_events WHERE deleted_at IS NULL ORDER BY id').all().map((r) => r.id);
+  assert.deepEqual(active, ['absent', 'explicit-null']);
+});
+
+test('payload 对齐: app 不发 schema_version，服务端补 1', async (t) => {
+  const { app, db } = makeApp();
+  t.after(() => { app.close(); db.close(); });
+  // klass2 的 schedule/todo 类型里根本没有 schema_version（只有 rating 有）
+  const ev = scheduleEvent({ id: 'nosv' }); delete ev.schema_version;
+  const td = todoItem({ id: 'nosv-t' }); delete td.schema_version;
+  assert.equal((await post(app, '/v1/schedule/sync', { records: [ev] })).json().rejected, 0);
+  assert.equal((await post(app, '/v1/todos/sync', { records: [td] })).json().rejected, 0);
+  assert.equal(db.prepare("SELECT schema_version FROM schedule_events WHERE id='nosv'").get().schema_version, 1);
+  assert.equal(db.prepare("SELECT schema_version FROM todos WHERE id='nosv-t'").get().schema_version, 1);
+});
+
+test('payload 对齐: 手动 UI 的 toISOString 与 whut-import 的朴素串归一到同一时刻', async (t) => {
+  const { app, db } = makeApp();
+  t.after(() => { app.close(); db.close(); });
+  // 同一节「上海 14:00」的课，两条路径写出两种形态，混存同一张表
+  await post(app, '/v1/schedule/sync', {
+    records: [
+      scheduleEvent({ id: 'ui', repeat: 'none', repeat_until: null,
+        start_time: '2026-09-08T06:00:00.000Z', end_time: '2026-09-08T07:40:00.000Z' }),
+      scheduleEvent({ id: 'import', repeat: 'none', repeat_until: null,
+        start_time: '2026-09-08T14:00:00', end_time: '2026-09-08T15:40:00' }),
+    ],
+  });
+  const rows = db.prepare('SELECT id, start_time FROM schedule_events ORDER BY id').all();
+  assert.equal(rows.find((r) => r.id === 'ui').start_time, '2026-09-08T14:00:00');
+  assert.equal(rows.find((r) => r.id === 'import').start_time, '2026-09-08T14:00:00');
+});
+
+test('payload 对齐: todo 懒升级产出的裸日期 updated_at 不被拒', async (t) => {
+  const { app, db } = makeApp();
+  t.after(() => { app.close(); db.close(); });
+  // todo.storage.ts:44 把未校验格式的 created_at 复制进 updated_at，
+  // 老记录可能是裸 '2025-03-01'。同步字段不做格式校验（与 ratings 一致），照收。
+  const res = await post(app, '/v1/todos/sync', {
+    records: [todoItem({ id: 'legacy', created_at: '2025-03-01', updated_at: '2025-03-01' })],
+  });
+  assert.equal(res.json().rejected, 0, JSON.stringify(res.json().errors));
+  assert.equal(db.prepare("SELECT updated_at FROM todos WHERE id='legacy'").get().updated_at, '2025-03-01');
+});
+
 /* ================= config/semester ================= */
 
 test('PUT /v1/config/semester 写入并可读回', async (t) => {

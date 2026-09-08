@@ -135,7 +135,8 @@ app 的批量同步端点同样不落行（那是手机的日常动作，不是�
 
 | 类别 | 字段 | 语义 | 格式 |
 |---|---|---|---|
-| 业务时间 | `start_time`、`end_time`、`repeat_until`、`last_reset`、`config.semester.start_date` | floating **Asia/Shanghai**（墙上钟点） | 裸本地 `YYYY-MM-DDTHH:mm:ss`（日期字段 `YYYY-MM-DD`） |
+| 业务时间 | `start_time`、`end_time`、`repeat_until`、`config.semester.start_date` | floating **Asia/Shanghai**（墙上钟点） | 裸本地 `YYYY-MM-DDTHH:mm:ss`（日期字段 `YYYY-MM-DD`） |
+| 时刻（不规范化） | `last_reset` | 绝对时刻 | app 写的是 `nowIso()`，**原样存回** |
 | 同步时间 | `created_at`、`updated_at`、`synced_at`、`deleted_at`、`last_synced` | 绝对时刻 | 真 UTC 毫秒 ISO `...Z` |
 
 业务时间的规范存储格式与 app 现状一致（whut-import 导入的真课表就是 `2026-09-08T08:00:00`，
@@ -220,7 +221,13 @@ done
 `todos`（对齐 app `TodoItem`）：
 - `type` ∈ `daily`/`weekly`/`longterm`
 - `priority` ∈ `high`/`medium`/`low`
-- `last_reset` 必填
+- `last_reset` 必填，且**是时刻不是日历日**：app 在新建、切换完成态、每日/每周重置四个写入点
+  写的都是 `new Date().toISOString()`，用来和「今天/本周」比对决定要不要重置完成状态。
+  服务端只校验「能解析」并**原样存回**——截成 `YYYY-MM-DD` 会丢掉时刻，手机在 UTC 以西
+  时区时回流值会落到前一个本地日，已完成的每日待办会被误重置。
+
+`schema_version`：app 的 schedule/todo 类型里没有这个字段（只有 rating 有），
+缺席时服务端补 `1`。
 
 `is_completed` 在库里存 0/1，出参还原成 boolean，与 app 类型一致。
 

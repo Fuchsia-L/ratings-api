@@ -81,10 +81,10 @@ say "推 2 条待办"
 curl -fsS -X POST "${sync_hdr[@]}" -d @- "$HOST/v1/todos/sync" <<EOF | jget "d['applied']" | grep -qx 2 || die "待办同步 applied != 2"
 {"records":[
  {"id":"smoke-todo-1","title":"刷线段树","type":"daily","priority":"high",
-  "is_completed":false,"last_reset":"$MONDAY",
+  "is_completed":false,"last_reset":"2026-09-07T22:30:00.000Z",
   "created_at":"$NOW","updated_at":"$NOW","synced_at":null,"schema_version":1},
  {"id":"smoke-todo-2","title":"写周报","type":"weekly","priority":"medium",
-  "is_completed":false,"last_reset":"$MONDAY",
+  "is_completed":false,"last_reset":"2026-09-07T22:30:00.000Z",
   "created_at":"$NOW","updated_at":"$NOW","synced_at":null,"schema_version":1}
 ]}
 EOF
@@ -163,6 +163,12 @@ done
 [ "$(curl -fsS -H "Authorization: Bearer $SYNC_TOKEN" "$HOST/v1/schedule" \
      | jget "[r['start_time'] for r in d['records'] if r['id']=='smoke-tz-zulu'][0]")" = "2026-09-10T14:00:00" ] \
   || die "带 Z 的输入应被规范化成裸上海格式存储"
+ok
+
+say "last_reset 是时刻不截断（payload 对齐审计回归）"
+[ "$(curl -fsS "${sync_hdr[@]}" "$HOST/v1/todos" \
+     | jget "[r['last_reset'] for r in d['records'] if r['id']=='smoke-todo-1'][0]")" = "2026-09-07T22:30:00.000Z" ] \
+  || die "last_reset 应原样存回（截成日历日会让 UTC 以西的手机误重置每日待办）"
 ok
 
 say "last_synced 不受记录里 synced_at=null 影响（合约缺陷回归）"

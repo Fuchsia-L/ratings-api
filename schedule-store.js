@@ -300,9 +300,13 @@ export function validateTodo(r) {
   if (r.is_completed != null && typeof r.is_completed !== 'boolean' && !Number.isInteger(r.is_completed)) {
     return 'is_completed must be boolean';
   }
+  // last_reset 是**时刻**不是日历日：app 写的是 nowIso()（todo.service.ts / refresh.ts），
+  // 用来和「今天/本周」比对决定每日、每周待办要不要重置完成状态。
+  // 服务端只做「能解析」的校验并原样存回 —— 截成 YYYY-MM-DD 会丢掉时刻，
+  // 手机在 UTC 以西时区时回流值会落到前一个本地日，导致已完成的每日待办被误重置。
   if (typeof r.last_reset !== 'string' || !r.last_reset) return 'last_reset required';
-  if (!isBusinessDate(r.last_reset)) {
-    return 'last_reset must be YYYY-MM-DD (Asia/Shanghai)';
+  if (!Number.isFinite(parseShanghai(r.last_reset))) {
+    return 'last_reset must be a parseable datetime or YYYY-MM-DD';
   }
   if (r.notes != null && (typeof r.notes !== 'string' || r.notes.length > MAX_NOTES)) {
     return `notes must be string <= ${MAX_NOTES}`;
@@ -325,7 +329,8 @@ export function normalizeTodo(r) {
     type: r.type,
     priority: r.priority,
     is_completed: r.is_completed ? 1 : 0,
-    last_reset: canonDate(r.last_reset),
+    // 原样存回：last_reset 是时刻，不规范化（见 validateTodo 里的说明）
+    last_reset: r.last_reset,
     notes: r.notes ?? null,
     created_at: r.created_at,
     updated_at: r.updated_at,

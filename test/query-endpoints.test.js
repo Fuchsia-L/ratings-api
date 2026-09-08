@@ -259,16 +259,73 @@ test('时区: 带 offset 与带毫秒的输入同样规范化', async (t) => {
     '2026-09-08T18:00:00');
 });
 
-test('时区: repeat_until / last_reset 带时区输入被规范化成上海自然日', async (t) => {
+test('时区: repeat_until 带时区输入被规范化成上海自然日', async (t) => {
   const { app, db } = makeApp();
   t.after(() => { app.close(); db.close(); });
-  await seed(app, {
-    events: [scheduleEvent({ id: 'ru', repeat_until: '2026-09-14T16:00:00Z' })],
-    todos: [todoItem({ id: 'lr', last_reset: '2026-09-07T16:00:00Z' })],
-  });
-  // 16:00Z = 上海次日 00:00 → 归到 09-15 / 09-08
+  await seed(app, { events: [scheduleEvent({ id: 'ru', repeat_until: '2026-09-14T16:00:00Z' })] });
+  // 16:00Z = 上海次日 00:00 → 归到 09-15
   assert.equal(db.prepare("SELECT repeat_until FROM schedule_events WHERE id='ru'").get().repeat_until, '2026-09-15');
-  assert.equal(db.prepare("SELECT last_reset FROM todos WHERE id='lr'").get().last_reset, '2026-09-08');
+});
+
+test('last_reset 是时刻不是日历日：原样存回，不截断', async (t) => {
+  const { app, db } = makeApp();
+  t.after(() => { app.close(); db.close(); });
+  // app 写的是 nowIso()（todo.service.ts addTodo / toggleTodo、refresh.ts 重置）
+  const appValue = '2026-09-08T14:23:45.123Z';
+  await seed(app, { todos: [todoItem({ id: 'lr', last_reset: appValue })] });
+  assert.equal(
+    db.prepare("SELECT last_reset FROM todos WHERE id='lr'").get().last_reset, appValue,
+    '截成 YYYY-MM-DD 会丢时刻：手机在 UTC 以西时区时回流值落到前一本地日，已完成的每日待办会被误重置',
+  );
+  // 拉回去的也是原值
+  const pulled = (await app.inject({ url: '/v1/todos', headers: auth() })).json();
+  assert.equal(pulled.records.find((r) => r.id === 'lr').last_reset, appValue);
+});
+
+test('last_reset 裸日期形态同样原样收下', async (t) => {
+  const { app, db } = makeApp();
+  t.after(() => { app.close(); db.close(); });
+  await seed(app, { todos: [todoItem({ id: 'bare', last_reset: '2026-09-08' })] });
+  assert.equal(db.prepare("SELECT last_reset FROM todos WHERE id='bare'").get().last_reset, '2026-09-08');
+});
+
+test('last_reset 截断会让 UTC 以西的手机误重置每日待办（回归说明）', async (t) => {
+  const { app, db } = makeApp();
+  t.after(() => { app.close(); db.close(); });
+  // Iris 上海 9/8 22:30 打勾完成 → app 写 nowIso()
+  const appValue = new Date('2026-09-08T22:30:00+08:00').toISOString(); // 14:30Z
+  await seed(app, { todos: [todoItem({ id: 'd', type: 'daily', is_completed: true, last_reset: appValue })] });
+  const back = (await app.inject({ url: '/v1/todos', headers: auth() })).json()
+    .records.find((r) => r.id === 'd').last_reset;
+
+  // 复刻 app refresh.ts 的判定：startOfDay(now) > startOfDay(last_reset) 就重置
+  // （把 UTC 时刻加上时区偏移得到本地墙钟，再取当日零点）
+  const startOfDayIn = (iso, offsetMin) => {
+    const local = new Date(new Date(iso).getTime() + offsetMin * 60000);
+    return Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate());
+  };
+  const stillSameShanghaiDay = '2026-09-08T23:59:00+08:00';
+  for (const [zone, offsetMin] of [['America/New_York(UTC-4)', -240], ['Asia/Shanghai(UTC+8)', 480]]) {
+    const resets = startOfDayIn(stillSameShanghaiDay, offsetMin) > startOfDayIn(back, offsetMin);
+    assert.equal(resets, false, `${zone}：回流值不该让同一天的已完成待办被重置`);
+  }
+  // 若服务端截成 '2026-09-08'，纽约手机上它会落到 9/7 本地日，从而误判重置
+  const truncated = '2026-09-08';
+  assert.equal(
+    startOfDayIn(stillSameShanghaiDay, -240) > startOfDayIn(truncated, -240), true,
+    '这行说明截断为什么有害：截断值在 UTC-4 下会触发误重置',
+  );
+});
+
+test('last_reset 解析不了仍 400', async (t) => {
+  const { app, db } = makeApp();
+  t.after(() => { app.close(); db.close(); });
+  const res = await app.inject({
+    method: 'POST', url: '/v1/todos/sync', headers: auth(),
+    payload: { records: [todoItem({ id: 'bad', last_reset: '不是时间' })] },
+  });
+  assert.equal(res.json().rejected, 1);
+  assert.match(res.json().errors[0].error, /last_reset/);
 });
 
 test('时区: 同步字段仍是真 UTC ISO，没被业务规范化碰到', async (t) => {
