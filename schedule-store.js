@@ -60,6 +60,15 @@ export function initScheduleSchema(db) {
       value_json TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
+
+    -- 服务端自己的运行时元数据，跟 config 分表存。
+    -- config 是 app 推上来的业务配置（会被 GET /v1/config/* 读出去），
+    -- meta 是服务端观测到的事实（last_push_*），不该跟着 config 漏给调用方——
+    -- 分表比在 config 上加过滤更保险：将来给 config 加端点也不会不小心带出去。
+    CREATE TABLE IF NOT EXISTS meta (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
   `);
 }
 
@@ -114,7 +123,6 @@ export function createStore(db) {
       listSince: db.prepare('SELECT * FROM schedule_events WHERE updated_at > ? ORDER BY updated_at DESC'),
       listActive: db.prepare('SELECT * FROM schedule_events WHERE deleted_at IS NULL'),
       findById: db.prepare('SELECT * FROM schedule_events WHERE id = ?'),
-      maxSyncedAt: db.prepare('SELECT max(synced_at) AS v FROM schedule_events'),
       validate: validateScheduleEvent,
       normalize: normalizeScheduleEvent,
       hydrate: hydrateScheduleRow,
@@ -125,7 +133,6 @@ export function createStore(db) {
       listSince: db.prepare('SELECT * FROM todos WHERE updated_at > ? ORDER BY updated_at DESC'),
       listActive: db.prepare('SELECT * FROM todos WHERE deleted_at IS NULL ORDER BY updated_at DESC'),
       findById: db.prepare('SELECT * FROM todos WHERE id = ?'),
-      maxSyncedAt: db.prepare('SELECT max(synced_at) AS v FROM todos'),
       validate: validateTodo,
       normalize: normalizeTodo,
       hydrate: hydrateTodoRow,
@@ -140,7 +147,38 @@ export function createStore(db) {
         WHERE excluded.updated_at > config.updated_at
       `),
     },
+    meta: {
+      get: db.prepare('SELECT value FROM meta WHERE key = ?'),
+      set: db.prepare(`
+        INSERT INTO meta (key, value) VALUES (@key, @value)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+      `),
+    },
   };
+}
+
+/** meta 表里记录「服务端最后一次收到该类数据推送」的 key。 */
+export const LAST_PUSH_KEYS = {
+  schedule: 'last_push_schedule',
+  todos: 'last_push_todos',
+};
+
+/**
+ * 记下服务端最后一次处理该类同步请求的时刻。
+ *
+ * 为什么不用 max(synced_at)：`synced_at` 是 app 收到服务端确认后在本地打的标记，
+ * 推上来的 pending 记录里它恒为 null，服务端永远看不到非 null 值——照 max(synced_at)
+ * 算出来的 last_synced 会永远是 null。真正能证明「手机刚活着推过」的是服务端自己
+ * 观测到的这次请求时间，所以由服务端持久记录。
+ *
+ * records 为空的纯拉取调用也刷新：app 发起了同步就说明它活着，数据是新鲜的。
+ */
+export function markPushed(store, kind, at) {
+  store.meta.set.run({ key: LAST_PUSH_KEYS[kind], value: at });
+}
+
+export function readLastPush(store, kind) {
+  return store.meta.get.get(LAST_PUSH_KEYS[kind])?.value ?? null;
 }
 
 function isIsoish(value) {

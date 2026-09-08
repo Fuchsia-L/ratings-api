@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { makeApp, auth, scheduleEvent, todoItem, insertRating, READONLY_TOKEN } from './helpers.js';
+import { makeApp, auth, scheduleEvent, todoItem, insertRating, READONLY_TOKEN, SYNC_TOKEN } from './helpers.js';
 import { shanghaiToday } from '../schedule-domain.js';
+import { buildApp } from '../app.js';
 
 async function seed(app, { events = [], todos = [], semester } = {}) {
   if (events.length) {
@@ -19,6 +20,9 @@ async function seed(app, { events = [], todos = [], semester } = {}) {
 
 const day = (app, date, token) =>
   app.inject({ url: date ? `/v1/schedule/day?date=${date}` : '/v1/schedule/day', headers: auth(token) });
+
+const win = (app, start, end, token) =>
+  app.inject({ url: `/v1/schedule/window?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`, headers: auth(token) });
 
 /* ================= /v1/schedule/day ================= */
 
@@ -43,10 +47,11 @@ test('day: 响应结构逐字段符合设计 §3', async (t) => {
   assert.equal(body.semester_week, 2);
   assert.equal(body.events.length, 1);
   assert.equal(body.todos.length, 1);
-  assert.deepEqual(body.last_synced, {
-    schedule: '2026-09-01T00:00:00.000Z',
-    todos: '2026-09-01T00:00:00.000Z',
-  });
+  // last_synced 是服务端记的「最后一次收到同步请求」，不是记录里的 synced_at。
+  // seed 刚推过，所以两个都该是刚才那一瞬。
+  assert.ok(body.last_synced.schedule, 'schedule 推过就该有值');
+  assert.ok(body.last_synced.todos, 'todos 推过就该有值');
+  assert.ok(Date.now() - Date.parse(body.last_synced.schedule) < 60_000, 'last_synced 应是刚刚');
   assert.ok(body.server_time);
 });
 
@@ -197,16 +202,116 @@ test('day: events 按实例开始时间排序', async (t) => {
   assert.deepEqual((await day(app, '2026-09-07')).json().events.map((e) => e.id), ['am', 'pm']);
 });
 
-test('day: 无数据时 last_synced 为 null', async (t) => {
+/* ---------- last_synced（数据新鲜度）语义 ---------- */
+
+test('last_synced: 一次都没推过时为 null', async (t) => {
   const { app, db } = makeApp();
   t.after(() => { app.close(); db.close(); });
   assert.deepEqual((await day(app, '2026-09-07')).json().last_synced, { schedule: null, todos: null });
 });
 
-/* ================= /v1/schedule/window ================= */
+test('last_synced: 记录里 synced_at 全为 null 也照样有值（合约缺陷回归）', async (t) => {
+  const { app, db } = makeApp();
+  t.after(() => { app.close(); db.close(); });
+  // app 推 pending 记录时 synced_at 恒为 null —— 服务端永远看不到非 null 值。
+  // 老实现照 max(synced_at) 算，这里会是 null；新实现记的是服务端观测到的推送时刻。
+  await seed(app, {
+    events: [scheduleEvent({ synced_at: null })],
+    todos: [todoItem({ synced_at: null })],
+  });
+  const ls = (await day(app, '2026-09-07')).json().last_synced;
+  assert.ok(ls.schedule, 'synced_at 为 null 也该有 last_synced.schedule');
+  assert.ok(ls.todos, 'synced_at 为 null 也该有 last_synced.todos');
+});
 
-const win = (app, start, end, token) =>
-  app.inject({ url: `/v1/schedule/window?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`, headers: auth(token) });
+test('last_synced: 推空 records 也刷新（app 活着就是新鲜）', async (t) => {
+  const { app, db } = makeApp();
+  t.after(() => { app.close(); db.close(); });
+
+  await app.inject({ method: 'POST', url: '/v1/schedule/sync', headers: auth(), payload: { records: [] } });
+  const first = (await day(app, '2026-09-07')).json().last_synced;
+  assert.ok(first.schedule, '空 records 的纯拉取调用也该刷新');
+  assert.equal(first.todos, null, 'todos 还没推过，仍是 null');
+
+  await new Promise((r) => setTimeout(r, 5));
+  await app.inject({ method: 'POST', url: '/v1/schedule/sync', headers: auth(), payload: { records: [] } });
+  const second = (await day(app, '2026-09-07')).json().last_synced;
+  assert.ok(second.schedule >= first.schedule, '再推一次应前进');
+
+  await app.inject({ method: 'POST', url: '/v1/todos/sync', headers: auth(), payload: { records: [] } });
+  assert.ok((await day(app, '2026-09-07')).json().last_synced.todos, 'todos 空推后也该有值');
+});
+
+test('last_synced: schedule 与 todos 各记各的', async (t) => {
+  const { app, db } = makeApp();
+  t.after(() => { app.close(); db.close(); });
+  await seed(app, { events: [scheduleEvent()] });
+  const ls = (await day(app, '2026-09-07')).json().last_synced;
+  assert.ok(ls.schedule);
+  assert.equal(ls.todos, null, '只推了课程，待办那栏不该被带上');
+});
+
+test('last_synced: 整批被拒也算推过（app 确实来过）', async (t) => {
+  const { app, db } = makeApp();
+  t.after(() => { app.close(); db.close(); });
+  const res = await app.inject({
+    method: 'POST', url: '/v1/schedule/sync', headers: auth(),
+    payload: { records: [scheduleEvent({ category: '不存在' })] },
+  });
+  assert.equal(res.json().rejected, 1);
+  assert.ok((await day(app, '2026-09-07')).json().last_synced.schedule);
+});
+
+test('last_synced: 400 的坏请求不刷新', async (t) => {
+  const { app, db } = makeApp();
+  t.after(() => { app.close(); db.close(); });
+  const res = await app.inject({
+    method: 'POST', url: '/v1/schedule/sync', headers: auth(), payload: { records: 'nope' },
+  });
+  assert.equal(res.statusCode, 400);
+  assert.equal((await day(app, '2026-09-07')).json().last_synced.schedule, null,
+    '请求格式就不对，不能算一次成功同步');
+});
+
+test('last_synced: window 响应同样带上', async (t) => {
+  const { app, db } = makeApp();
+  t.after(() => { app.close(); db.close(); });
+  await seed(app, { events: [scheduleEvent()], todos: [todoItem()] });
+  const ls = (await win(app, '2026-09-07', '2026-09-14')).json().last_synced;
+  assert.ok(ls.schedule);
+  assert.ok(ls.todos);
+});
+
+test('last_synced: 跨重启持久（写进库，不是内存）', async (t) => {
+  const { app, db } = makeApp();
+  t.after(() => { app.close(); db.close(); });
+  await seed(app, { events: [scheduleEvent()] });
+  const before = (await day(app, '2026-09-07')).json().last_synced.schedule;
+
+  // 同一个 db 上重建一个 app 实例，模拟进程重启
+  const app2 = buildApp({ db, syncToken: SYNC_TOKEN, readonlyToken: READONLY_TOKEN, logger: false });
+  t.after(() => app2.close());
+  const after = (await app2.inject({ url: '/v1/schedule/day?date=2026-09-07', headers: auth() })).json().last_synced.schedule;
+  assert.equal(after, before, '重启后仍读得到');
+});
+
+test('last_synced: 不从 GET /v1/config/semester 漏出去', async (t) => {
+  const { app, db } = makeApp();
+  t.after(() => { app.close(); db.close(); });
+  await seed(app, {
+    events: [scheduleEvent()],
+    todos: [todoItem()],
+    semester: { start_date: '2026-09-01', total_weeks: 18, updated_at: '2026-09-01T00:00:00.000Z' },
+  });
+  const body = (await app.inject({ url: '/v1/config/semester', headers: auth() })).json();
+  assert.deepEqual(Object.keys(body.semester).sort(), ['start_date', 'total_weeks', 'updated_at']);
+  assert.ok(!JSON.stringify(body).includes('last_push'), 'config 端点不该带出 last_push_*');
+  // config 表里也不该混进 meta 的 key
+  const configKeys = db.prepare('SELECT key FROM config').all().map((r) => r.key);
+  assert.deepEqual(configKeys, ['semester']);
+});
+
+/* ================= /v1/schedule/window ================= */
 
 test('window: 展开区间内全部实例', async (t) => {
   const { app, db } = makeApp();

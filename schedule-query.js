@@ -12,7 +12,7 @@ import {
   shanghaiToday,
   shanghaiWeekday,
 } from './schedule-domain.js';
-import { readSemester } from './schedule-store.js';
+import { readSemester, readLastPush } from './schedule-store.js';
 
 export const MAX_WINDOW_DAYS = 62;
 const DAY_MS = 86400000;
@@ -77,10 +77,17 @@ function matchRatings(candidates, instance) {
     }));
 }
 
+/**
+ * 数据新鲜度：服务端最后一次收到 app 同步请求的时刻。
+ *
+ * 注意不是 max(synced_at)——那个字段是 app 收到确认后打的本地标记，推上来时恒为 null，
+ * 服务端永远看不到非 null 值。这里返回服务端自己记的 last_push_*（见 schedule-store.js
+ * 的 markPushed），null 现在真表示「一次都没推过」。
+ */
 export function lastSynced(store) {
   return {
-    schedule: store.schedule.maxSyncedAt.get()?.v ?? null,
-    todos: store.todos.maxSyncedAt.get()?.v ?? null,
+    schedule: readLastPush(store, 'schedule'),
+    todos: readLastPush(store, 'todos'),
   };
 }
 

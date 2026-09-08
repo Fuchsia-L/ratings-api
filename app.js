@@ -3,7 +3,7 @@ import Database from 'better-sqlite3';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { buildSummary, parseSummaryDays } from './summary.js';
-import { createStore, runSync, validateSemester, readSemester } from './schedule-store.js';
+import { createStore, runSync, validateSemester, readSemester, markPushed } from './schedule-store.js';
 import { buildDay, buildWindow, validateWindow, DATE_RE } from './schedule-query.js';
 
 /**
@@ -264,7 +264,7 @@ export function buildApp({ db, syncToken, readonlyToken, internalToken, logger =
 
   /* ---------------- schedule / todos 同步（语义 = ratings） ---------------- */
 
-  function syncHandler(entity) {
+  function syncHandler(entity, kind) {
     return async (req, reply) => {
       const body = req.body ?? {};
       if (!Array.isArray(body.records)) {
@@ -275,13 +275,17 @@ export function buildApp({ db, syncToken, readonlyToken, internalToken, logger =
       }
       const since = typeof body.since === 'string' ? body.since : null;
       const { applied, rejected, errors } = runSync(db, entity, body.records);
+      const serverTime = new Date().toISOString();
+      // 请求走到这里就说明 app 活着并完成了一次同步 —— 记为数据新鲜度基准。
+      // records 为空的纯拉取调用同样算数（app 在跑就够了），格式错的请求已在上面 400 返回。
+      markPushed(store, kind, serverTime);
       const rows = since ? entity.listSince.all(since) : entity.listAll.all();
       return {
         applied,
         rejected,
         errors: errors.length ? errors : undefined,
         records: rows.map(entity.hydrate),
-        server_time: new Date().toISOString(),
+        server_time: serverTime,
       };
     };
   }
@@ -297,8 +301,8 @@ export function buildApp({ db, syncToken, readonlyToken, internalToken, logger =
     };
   }
 
-  fastify.post('/v1/schedule/sync', syncHandler(store.schedule));
-  fastify.post('/v1/todos/sync', syncHandler(store.todos));
+  fastify.post('/v1/schedule/sync', syncHandler(store.schedule, 'schedule'));
+  fastify.post('/v1/todos/sync', syncHandler(store.todos, 'todos'));
   fastify.get('/v1/schedule', pullHandler(store.schedule));
   fastify.get('/v1/todos', pullHandler(store.todos));
 

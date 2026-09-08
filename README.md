@@ -10,7 +10,8 @@ CyberSchedule TimeSlotRating 同步服务，部署在 `api.epoch0.org`。
   - `READONLY_TOKEN`（mooring Claude 用）——**仅** `GET /v1/schedule/day` 与
     `GET /v1/schedule/window`，调其他端点 403；**可选**，缺失只是关掉这条只读入口，不 fatal
   - `INTERNAL_TOKEN`（同机鹊桥）——仅 `/internal/*`，行为不变
-- SQLite 落盘在 `./data/ratings.db`，表：`ratings`（现有）+ `schedule_events` + `todos` + `config`
+- SQLite 落盘在 `./data/ratings.db`，表：`ratings`（现有）+ `schedule_events` + `todos` +
+  `config`（app 的业务配置）+ `meta`（服务端运行时元数据，如数据新鲜度）
 - 绑 127.0.0.1，外部走 nginx 反代 + Let's Encrypt
 
 代码分层：`server.js`（只负责读 env、开库、listen）→ `app.js`（`buildApp()` 建 Fastify 实例，
@@ -63,6 +64,21 @@ CyberSchedule TimeSlotRating 同步服务，部署在 `api.epoch0.org`。
 
 **评分关联**：`ratings.linked_event_id = 母事件 id` 且 slot 与实例时间重叠，或 slot 落在
 实例所在的那个 Asia/Shanghai 自然日；软删除的评分不算。
+
+**`last_synced`（数据新鲜度）**：服务端**自己记录**的「最后一次收到该类同步请求的时刻」，
+存在 `meta` 表的 `last_push_schedule` / `last_push_todos`。
+
+注意它**不是** `max(synced_at)`：`synced_at` 是 app 收到服务端确认后打的本地标记，
+推上来的 pending 记录里恒为 `null`，服务端永远看不到非 null 值——按 `max(synced_at)` 算
+会永远返回 `null`，CLI 就算刚拿到数据也会显示「还没收到过手机同步」。改成服务端记录后，
+`null` 现在真表示「一次都没推过」。
+
+刷新规则：`POST /v1/schedule/sync`、`POST /v1/todos/sync` 每次成功处理后刷新，
+**`records` 为空的纯拉取调用也算**（app 发起同步就说明它活着）；整批记录被校验拒绝也算
+（app 确实来过）；请求格式错误返回 400 的不算。两类数据各记各的。
+
+`meta` 表与 `config` 分开存：`config` 是 app 推上来、会被 `GET /v1/config/*` 读出去的业务
+配置，`meta` 是服务端观测到的事实，分表比加过滤更保险，不会哪天顺手漏出去。
 
 ## 时区（本项目最大的坑）
 

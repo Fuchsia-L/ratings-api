@@ -62,15 +62,15 @@ curl -fsS -X POST "${sync_hdr[@]}" -d @- "$HOST/v1/schedule/sync" <<EOF | jget "
   "start_time":"${MONDAY}T08:00:00.000+08:00","end_time":"${MONDAY}T09:40:00.000+08:00",
   "repeat":"weekly","repeat_until":"2026-12-31","location":"教三 401","reminder_minutes":15,
   "source":"manual","is_completed":false,
-  "created_at":"$NOW","updated_at":"$NOW","synced_at":"$NOW","schema_version":1},
+  "created_at":"$NOW","updated_at":"$NOW","synced_at":null,"schema_version":1},
  {"id":"smoke-gym","title":"游泳","category":"运动",
   "start_time":"${MONDAY}T18:00:00.000+08:00","end_time":"${MONDAY}T19:00:00.000+08:00",
   "repeat":"none","is_completed":false,
-  "created_at":"$NOW","updated_at":"$NOW","synced_at":"$NOW","schema_version":1},
+  "created_at":"$NOW","updated_at":"$NOW","synced_at":null,"schema_version":1},
  {"id":"smoke-night","title":"夜间自习","category":"学习",
   "start_time":"${MONDAY}T23:00:00.000+08:00","end_time":"2026-09-08T01:00:00.000+08:00",
   "repeat":"none","is_completed":false,
-  "created_at":"$NOW","updated_at":"$NOW","synced_at":"$NOW","schema_version":1}
+  "created_at":"$NOW","updated_at":"$NOW","synced_at":null,"schema_version":1}
 ]}
 EOF
 ok
@@ -80,10 +80,10 @@ curl -fsS -X POST "${sync_hdr[@]}" -d @- "$HOST/v1/todos/sync" <<EOF | jget "d['
 {"records":[
  {"id":"smoke-todo-1","title":"刷线段树","type":"daily","priority":"high",
   "is_completed":false,"last_reset":"$MONDAY",
-  "created_at":"$NOW","updated_at":"$NOW","synced_at":"$NOW","schema_version":1},
+  "created_at":"$NOW","updated_at":"$NOW","synced_at":null,"schema_version":1},
  {"id":"smoke-todo-2","title":"写周报","type":"weekly","priority":"medium",
   "is_completed":false,"last_reset":"$MONDAY",
-  "created_at":"$NOW","updated_at":"$NOW","synced_at":"$NOW","schema_version":1}
+  "created_at":"$NOW","updated_at":"$NOW","synced_at":null,"schema_version":1}
 ]}
 EOF
 ok
@@ -116,8 +116,18 @@ DAY_JSON=$(curl -fsS "${ro_hdr[@]}" "$HOST/v1/schedule/day?date=$MONDAY")
   || die "母事件 start_time 应保持母值"
 echo "$DAY_JSON" | jget "d['events'][0]['instance_start']" | grep -q '^2026-09-07T00:00:00' \
   || die "instance_start 应为 UTC 2026-09-07T00:00（= +08 08:00）"
-[ "$(echo "$DAY_JSON" | jget "d['last_synced']['schedule']")" = "$NOW" ] || die "last_synced.schedule 不对"
-[ "$(echo "$DAY_JSON" | jget "d['last_synced']['todos']")" = "$NOW" ]    || die "last_synced.todos 不对"
+# last_synced 是服务端记的「最后一次收到同步请求」，不是记录里的 synced_at
+# （app 推 pending 记录时 synced_at 恒为 null，服务端永远看不到非 null 值）。
+echo "$DAY_JSON" | jget "d['last_synced']['schedule'] or ''" | grep -q '^2' \
+  || die "last_synced.schedule 应有服务端记录的推送时刻"
+echo "$DAY_JSON" | jget "d['last_synced']['todos'] or ''" | grep -q '^2' \
+  || die "last_synced.todos 应有服务端记录的推送时刻"
+ok
+
+say "last_synced 不受记录里 synced_at=null 影响（合约缺陷回归）"
+[ "$(curl -fsS -H "Authorization: Bearer $SYNC_TOKEN" "$HOST/v1/schedule" \
+     | jget "str(d['records'][0]['synced_at'])")" = "None" ] \
+  || die "烟测应模拟 app 的真实推送形态：synced_at 为 null"
 ok
 
 say "重复课下一周（$MONDAY +7）仍在，非重复课不在"
@@ -169,17 +179,28 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $SYNC_TO
 ok
 
 say "LWW：改一门课再推，查询见变化"
+PREV_SYNCED=$(curl -fsS "${ro_hdr[@]}" "$HOST/v1/schedule/day?date=$MONDAY" | jget "d['last_synced']['schedule']")
+sleep 1
 curl -fsS -X POST "${sync_hdr[@]}" -d @- "$HOST/v1/schedule/sync" <<EOF | jget "d['applied']" | grep -qx 1 || die "改课未写入"
 {"records":[
  {"id":"smoke-gym","title":"游泳(改到 20:00)","category":"运动",
   "start_time":"${MONDAY}T20:00:00.000+08:00","end_time":"${MONDAY}T21:00:00.000+08:00",
   "repeat":"none","is_completed":false,
-  "created_at":"$NOW","updated_at":"2026-09-05T00:00:00.000Z","synced_at":"2026-09-05T00:00:00.000Z","schema_version":1}]}
+  "created_at":"$NOW","updated_at":"2026-09-05T00:00:00.000Z","synced_at":null,"schema_version":1}]}
 EOF
 AFTER=$(curl -fsS "${ro_hdr[@]}" "$HOST/v1/schedule/day?date=$MONDAY")
 echo "$AFTER" | jget "[e['title'] for e in d['events']]" | grep -q '改到 20:00' || die "改动未反映到查询"
-[ "$(echo "$AFTER" | jget "d['last_synced']['schedule']")" = "2026-09-05T00:00:00.000Z" ] \
-  || die "last_synced 未跟着更新"
+NEW_SYNCED=$(echo "$AFTER" | jget "d['last_synced']['schedule']")
+[ "$NEW_SYNCED" \> "$PREV_SYNCED" ] \
+  || die "last_synced 应随新一次推送前进（$PREV_SYNCED -> $NEW_SYNCED）"
+ok
+
+say "推空 records 也刷新 last_synced（app 活着就是新鲜）"
+BEFORE_EMPTY=$(curl -fsS "${ro_hdr[@]}" "$HOST/v1/schedule/day?date=$MONDAY" | jget "d['last_synced']['todos']")
+sleep 1
+curl -fsS -X POST "${sync_hdr[@]}" -d '{"records":[]}' "$HOST/v1/todos/sync" >/dev/null
+AFTER_EMPTY=$(curl -fsS "${ro_hdr[@]}" "$HOST/v1/schedule/day?date=$MONDAY" | jget "d['last_synced']['todos']")
+[ "$AFTER_EMPTY" \> "$BEFORE_EMPTY" ] || die "空 records 的纯拉取调用也该刷新 last_synced.todos（$BEFORE_EMPTY -> $AFTER_EMPTY）"
 ok
 
 say "tombstone：软删一门课后 day 里消失"
@@ -188,7 +209,7 @@ curl -fsS -X POST "${sync_hdr[@]}" -d @- "$HOST/v1/schedule/sync" <<EOF >/dev/nu
  {"id":"smoke-gym","title":"游泳(改到 20:00)","category":"运动",
   "start_time":"${MONDAY}T20:00:00.000+08:00","end_time":"${MONDAY}T21:00:00.000+08:00",
   "repeat":"none","is_completed":false,
-  "created_at":"$NOW","updated_at":"2026-09-06T00:00:00.000Z","synced_at":"2026-09-06T00:00:00.000Z",
+  "created_at":"$NOW","updated_at":"2026-09-06T00:00:00.000Z","synced_at":null,
   "deleted_at":"2026-09-06T00:00:00.000Z","schema_version":1}]}
 EOF
 DEL=$(curl -fsS "${ro_hdr[@]}" "$HOST/v1/schedule/day?date=$MONDAY")
