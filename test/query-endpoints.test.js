@@ -156,6 +156,7 @@ test('day: 非法 date → 400', async (t) => {
   t.after(() => { app.close(); db.close(); });
   assert.equal((await day(app, '2026-9-7')).statusCode, 400);
   assert.equal((await day(app, 'today')).statusCode, 400);
+  assert.equal((await day(app, '2026-02-30')).statusCode, 400);
 });
 
 test('day: 无学期配置时 semester_week 为 null', async (t) => {
@@ -354,6 +355,7 @@ test('window: 缺参数 / 顺序颠倒 / 非法时间 → 400', async (t) => {
   assert.equal((await app.inject({ url: '/v1/schedule/window?start=2026-09-08', headers: auth() })).statusCode, 400);
   assert.equal((await win(app, '2026-09-10', '2026-09-01')).statusCode, 400);
   assert.equal((await win(app, 'garbage', '2026-09-01')).statusCode, 400);
+  assert.equal((await win(app, '2026-02-30', '2026-03-01')).statusCode, 400);
 });
 
 test('window: ratings 关联同 day', async (t) => {

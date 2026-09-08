@@ -4,7 +4,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { buildSummary, parseSummaryDays } from './summary.js';
 import { createStore, runSync, validateSemester, readSemester, markPushed } from './schedule-store.js';
-import { buildDay, buildWindow, validateWindow, DATE_RE } from './schedule-query.js';
+import { buildDay, buildWindow, validateWindow, DATE_RE, isValidDateString } from './schedule-query.js';
 import {
   createAuditWriter,
   buildCreateRecord,
@@ -387,7 +387,7 @@ export function buildApp({ db, syncToken, readonlyToken, writeToken, internalTok
       if (typeof date !== 'string' || !DATE_RE.test(date)) {
         return reply.code(400).send({ error: 'date must be YYYY-MM-DD' });
       }
-      if (Number.isNaN(Date.parse(`${date}T00:00:00.000+08:00`))) {
+      if (!isValidDateString(date)) {
         return reply.code(400).send({ error: 'date is not a valid calendar date' });
       }
     }

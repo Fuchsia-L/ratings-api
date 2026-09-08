@@ -19,6 +19,13 @@ const DAY_MS = 86400000;
 
 export const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
+/** 严格校验 YYYY-MM-DD，避免 Date 把 2 月 30 日静默滚到下个月。 */
+export function isValidDateString(value) {
+  if (typeof value !== 'string' || !DATE_RE.test(value)) return false;
+  const parsed = shanghaiDayStart(value);
+  return !Number.isNaN(parsed.getTime()) && formatShanghaiDate(parsed) === value;
+}
+
 /**
  * 展开区间内的实例，并挂上关联评分。
  * 评分关联规则（设计 §3）：ratings.linked_event_id = 母事件 id
@@ -132,6 +139,13 @@ export function buildWindow(store, startIso, endIso, now = new Date()) {
 export function validateWindow(startRaw, endRaw) {
   if (typeof startRaw !== 'string' || !startRaw) return { error: 'start required' };
   if (typeof endRaw !== 'string' || !endRaw) return { error: 'end required' };
+
+  if (DATE_RE.test(startRaw) && !isValidDateString(startRaw)) {
+    return { error: 'start must be ISO datetime or YYYY-MM-DD' };
+  }
+  if (DATE_RE.test(endRaw) && !isValidDateString(endRaw)) {
+    return { error: 'end must be ISO datetime or YYYY-MM-DD' };
+  }
 
   const start = DATE_RE.test(startRaw) ? shanghaiDayStart(startRaw) : new Date(startRaw);
   const end = DATE_RE.test(endRaw) ? shanghaiDayEnd(endRaw) : new Date(endRaw);
