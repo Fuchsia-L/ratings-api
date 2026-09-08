@@ -5,19 +5,25 @@ CyberSchedule TimeSlotRating 同步服务，部署在 `api.epoch0.org`。
 ## 架构
 
 - Fastify + better-sqlite3（WAL 模式）
-- Bearer token 认证，三级：
+- Bearer token 认证，四级：
   - `SYNC_TOKEN`（app 用）——全部 `/v1`；缺失或短于 32 字符则**启动失败**
-  - `READONLY_TOKEN`（mooring Claude 用）——**仅** `GET /v1/schedule/day` 与
+  - `READONLY_TOKEN`（mooring Claude 查询用）——**仅** `GET /v1/schedule/day` 与
     `GET /v1/schedule/window`，调其他端点 403；**可选**，缺失只是关掉这条只读入口，不 fatal
+  - `WRITE_TOKEN`（mooring Claude 增删改用）——写端点 + 查询端点 + 单条读；
+    调同步端点（app 的批量推送）403；**可选**，缺失只是关掉写入口，不 fatal
   - `INTERNAL_TOKEN`（同机鹊桥）——仅 `/internal/*`，行为不变
+
+  语义约定：**401 = token 缺失或不认识；403 = 认得这把钥匙但这扇门不归它开。**
+
 - SQLite 落盘在 `./data/ratings.db`，表：`ratings`（现有）+ `schedule_events` + `todos` +
-  `config`（app 的业务配置）+ `meta`（服务端运行时元数据，如数据新鲜度）
+  `config`（app 的业务配置）+ `meta`（服务端运行时元数据，如数据新鲜度）+
+  `audit_log`（写端点留痕，只写不读，要看直接查 SQLite）
 - 绑 127.0.0.1，外部走 nginx 反代 + Let's Encrypt
 
 代码分层：`server.js`（只负责读 env、开库、listen）→ `app.js`（`buildApp()` 建 Fastify 实例，
 可被测试直接 inject）→ `schedule-store.js`（三表 schema/校验/同步事务）、
 `schedule-query.js`（day/window 组装）、`schedule-domain.js`（repeat/conflicts 移植）、
-`summary.js`（内部汇总）。
+`schedule-write.js`（v3 写端点的记录组装与 audit_log）、`summary.js`（内部汇总）。
 
 ## 端点
 
@@ -50,7 +56,7 @@ CyberSchedule TimeSlotRating 同步服务，部署在 `api.epoch0.org`。
                   "ratings": [ {"rating":4,"efficiency":5,"mood":null,"activity":null,
                                 "reflection":null,"slot_start":"...","slot_end":"..."} ] } ],
     "todos": [ "...当天活跃待办（软删除外）" ],
-    "last_synced": { "schedule": "<max synced_at>", "todos": "<max synced_at>" },
+    "last_synced": { "schedule": "<服务端记的最后一次推送时刻>", "todos": "<同左>" },
     "server_time": "..."
   }
   ```
@@ -79,6 +85,44 @@ CyberSchedule TimeSlotRating 同步服务，部署在 `api.epoch0.org`。
 
 `meta` 表与 `config` 分开存：`config` 是 app 推上来、会被 `GET /v1/config/*` 读出去的业务
 配置，`meta` 是服务端观测到的事实，分表比加过滤更保险，不会哪天顺手漏出去。
+
+### 写端点（v3，`WRITE_TOKEN` 或 `SYNC_TOKEN`）
+
+**服务端是时间戳权威**：`created_at` / `updated_at` 一律由服务端生成，caller 传了也被覆盖；
+`synced_at` 与 `deleted_at` 同样不接受 caller 赋值。理由是 mooring 与手机两个钟不一定同步，
+让远端 caller 自己写 `updated_at` 等于把 LWW 的胜负交给时钟漂移。
+`id` caller 可给、缺省服务端生成 UUID；课程 `source` 缺省 `'claude'`。
+
+- `POST /v1/schedule/events` — 先字段校验（错 400），再对**全部活跃事件**跑冲突检测
+  （重复课先展开成实例再比）。冲突 → `409 {error:"conflict", conflicts:[完整冲突事件]}`；
+  id 已存在 → `409 {error:"id_exists", current_record}`；成功 `201 {record, server_time}`。
+- `PATCH /v1/schedule/events/:id` — body 必须带 `expected_updated_at`（缺则 400），
+  与当前值不符 → `409 {error:"stale", current_record}`。部分字段 merge，
+  显式传 `null` = 清空该字段。**改动了 `start_time`/`end_time`/`repeat`/`repeat_until`
+  才重跑冲突检测**（排除自身 id），冲突 409。成功 `200 {record, server_time}`。
+- `DELETE /v1/schedule/events/:id` — `expected_updated_at` 走 body 或 query 均可；
+  软删（写 `deleted_at` + `updated_at`），成功 `200` 返回 tombstone。
+- `POST /v1/todos`、`PATCH /v1/todos/:id`、`DELETE /v1/todos/:id` — 同模式，无冲突检测。
+- `GET /v1/schedule/events/:id`、`GET /v1/todos/:id` — 单条读，**含软删记录**并以
+  `deleted: true` 标明（caller 靠它拿 `expected_updated_at`）。不存在 → 404。
+
+对已软删或不存在的 id 做 PATCH/DELETE 一律 404——改一条已经删掉的课没有意义。
+
+### `audit_log`
+
+所有写端点**无论成败**落一行：`ts`、`token_kind`（sync/write）、`endpoint`、`method`、
+`record_id`、`payload_summary`（JSON 截断到 500 字符）、`outcome`（`created` / `updated` /
+`deleted` / `conflict` / `stale` / `validation_error` / `not_found` / `id_exists`）。
+
+不开读取端点，要看直接查 SQLite：
+
+```bash
+sqlite3 /var/www/ratings-api/data/ratings.db \
+  'SELECT ts, token_kind, method, endpoint, record_id, outcome FROM audit_log ORDER BY id DESC LIMIT 20;'
+```
+
+401/403 被鉴权钩子挡在路由之前，**不落 audit 行**——审计记的是「被授权的调用做了什么」。
+app 的批量同步端点同样不落行（那是手机的日常动作，不是谁的定向写入）。
 
 ## 时区（本项目最大的坑）
 
@@ -115,6 +159,18 @@ npm start
 - `deploy/nginx-api.conf` — nginx server block（certbot 会自动改写为 HTTPS）
 
 环境变量文件在 VPS 侧独立路径：`/etc/ratings-api.env`（systemd `EnvironmentFile` 引用，不进 git）。
+
+四个 token 各自独立生成，别复用：
+
+```bash
+for k in SYNC_TOKEN READONLY_TOKEN WRITE_TOKEN INTERNAL_TOKEN; do
+  printf '%s=%s\n' "$k" "$(openssl rand -hex 32)"
+done
+```
+
+`READONLY_TOKEN` 与 `WRITE_TOKEN` 要抄进 mooring 的 `~/.config/klass/env`
+（分别是 `KLASS_READONLY_TOKEN` 与 `KLASS_WRITE_TOKEN`）。加完 `WRITE_TOKEN` 需重启服务
+才生效；不填也能起，只是写端点关着。
 
 ## 校验规则
 
@@ -153,11 +209,15 @@ npm start
 - app 端不带（一个终端自己不冲突，LWW 足够）
 - MCP / Lux 端**必须**带：改之前先 `GET` 读最新，带上读到的 `updated_at` 作为 `expected_updated_at`。这样"被 app 抢先改过"的场景能明确反馈给 Lux，由 Lux 跟用户确认后再写
 
+课程/待办的 `sync` 端点语义相同。v3 的 `PATCH`/`DELETE` 写端点则把它从「可选」升级为
+**强制**：不带 `expected_updated_at` 直接 400，不符则 409 并奉还 `current_record`。
+
 ## 测试与烟测
 
 ```bash
-npm test                          # node:test，串行（1C/1G VPS 上别开并行）
-bash deploy/smoke-schedule.sh     # 课程/待办端到端：自己起临时 server，跑完自动清理
+npm test                          # node:test，串行（1C/1G VPS 上别开并行）；113 个用例
+bash deploy/smoke-schedule.sh     # 课程/待办端到端 31 阶段（含 v3 写端点与 audit）：
+                                  # 自己起临时 server、自带三个 token，跑完自动清理
 TOKEN=<server token> HOST=https://api.epoch0.org bash deploy/smoke.sh   # 线上 ratings 烟测
 ```
 
