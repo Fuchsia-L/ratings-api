@@ -8,6 +8,9 @@ User=ratings
 Group=ratings
 WorkingDirectory=/var/www/ratings-api
 EnvironmentFile=/etc/ratings-api.env
+# 服务端一切「本地日期」由代码显式按 Asia/Shanghai 计算（见 schedule-domain.js），
+# 不依赖进程时区。这里钉死 UTC 只是让这条不变量显式化，改它不会改变查询结果。
+Environment=TZ=UTC
 ExecStart=/usr/bin/node server.js
 Restart=on-failure
 RestartSec=5
