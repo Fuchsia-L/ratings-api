@@ -86,6 +86,20 @@ const PATCH_PROTECTED = new Set([...SERVER_OWNED, 'id']);
 const TIME_FIELDS = ['start_time', 'end_time', 'repeat', 'repeat_until'];
 
 /**
+ * 生成严格晚于当前记录的服务端版本戳。
+ *
+ * 连续请求可能落在同一毫秒；若 PATCH 沿用与旧记录相同的 updated_at，旧的
+ * expected_updated_at 仍会命中，乐观并发就失效。当前值若来自未来时钟，也仍需
+ * 保持单调，才能继续参与 LWW 同步。
+ */
+export function nextVersionTime(currentUpdatedAt, now = new Date()) {
+  const nowMs = now.getTime();
+  const currentMs = Date.parse(currentUpdatedAt);
+  const nextMs = Number.isFinite(currentMs) ? Math.max(nowMs, currentMs + 1) : nowMs;
+  return new Date(nextMs).toISOString();
+}
+
+/**
  * POST 的记录组装：caller 的业务字段 + 服务端的时间戳与默认值。
  * @param {object} body caller 传的 body
  * @param {string} serverTime 服务端此刻（ISO）

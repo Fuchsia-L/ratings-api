@@ -10,8 +10,15 @@ import {
   makeApp, auth, auditRows, scheduleEvent, todoItem,
   SYNC_TOKEN, READONLY_TOKEN, WRITE_TOKEN,
 } from './helpers.js';
+import { nextVersionTime } from '../schedule-write.js';
 
 const WRITE = auth(WRITE_TOKEN);
+
+test('版本戳在同毫秒和服务端时钟落后时仍严格递增', () => {
+  const current = '2026-09-08T12:00:00.000Z';
+  assert.equal(nextVersionTime(current, new Date(current)), '2026-09-08T12:00:00.001Z');
+  assert.equal(nextVersionTime(current, new Date('2026-09-08T11:59:59.000Z')), '2026-09-08T12:00:00.001Z');
+});
 
 function post(app, url, payload, headers = WRITE) {
   return app.inject({ method: 'POST', url, headers, payload });
@@ -486,6 +493,7 @@ test('待办 PATCH/DELETE：同模式，无冲突检测', async (t) => {
   assert.equal(patched.json().record.is_completed, true);
   assert.equal(patched.json().record.priority, 'low');
   assert.equal(patched.json().record.title, '刷线段树');
+  assert.ok(patched.json().record.updated_at > updatedAt, '版本戳必须严格递增，即使两次写入发生在同一毫秒');
 
   const stale = await patch(app, '/v1/todos/t1', {
     expected_updated_at: updatedAt, title: '基于旧版',

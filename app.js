@@ -13,6 +13,7 @@ import {
   touchesTimeFields,
   findConflicts,
   readExpectedUpdatedAt,
+  nextVersionTime,
 } from './schedule-write.js';
 
 /**
@@ -517,7 +518,8 @@ export function buildApp({ db, syncToken, readonlyToken, writeToken, internalTok
         });
       }
 
-      const merged = buildPatchRecord(current, body, serverTime);
+      const versionTime = nextVersionTime(current.updated_at, new Date(serverTime));
+      const merged = buildPatchRecord(current, body, versionTime);
       const err = entity.validate(merged);
       if (err) {
         return done(req, reply, {
@@ -538,7 +540,7 @@ export function buildApp({ db, syncToken, readonlyToken, writeToken, internalTok
       const saved = entity.hydrate(entity.findById.get(id));
       return done(req, reply, {
         code: 200, outcome: 'updated', recordId: id,
-        body: { record: saved, server_time: serverTime },
+        body: { record: saved, server_time: versionTime },
       });
     });
 
@@ -567,11 +569,12 @@ export function buildApp({ db, syncToken, readonlyToken, writeToken, internalTok
         });
       }
 
-      entity.force.run(entity.normalize(buildTombstone(current, serverTime)));
+      const versionTime = nextVersionTime(current.updated_at, new Date(serverTime));
+      entity.force.run(entity.normalize(buildTombstone(current, versionTime)));
       const saved = entity.hydrate(entity.findById.get(id));
       return done(req, reply, {
         code: 200, outcome: 'deleted', recordId: id,
-        body: { record: saved, server_time: serverTime },
+        body: { record: saved, server_time: versionTime },
       });
     });
   }
